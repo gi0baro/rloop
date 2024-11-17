@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := all
-pysources = rloop
+pysources = rloop tests
 
 .PHONY: build-dev
 build-dev:
