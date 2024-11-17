@@ -1,0 +1,51 @@
+[package]
+name = "rloop"
+version = "0.1.0-alpha1"
+description = "An asyncio event loop implemented in Rust"
+authors = ["Giovanni Barillari <g@baro.dev>"]
+license = "BSD-3-Clause"
+edition = "2021"
+
+keywords = ["asyncio"]
+
+readme = "README.md"
+homepage = "https://github.com/gi0baro/rloop"
+repository = "https://github.com/gi0baro/rloop"
+
+include = [
+    "/Cargo.toml",
+    "/pyproject.toml",
+    "/LICENSE",
+    "/README.md",
+    "/src",
+    "/rloop",
+    "/tests",
+    "!__pycache__",
+    "!tests/.pytest_cache",
+    "!*.so",
+]
+
+[lib]
+name = "_rloop"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "=1.0"
+dashmap = { version = "=6.1", features = ["inline"] }
+mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
+pyo3 = { version = "=0.22", features = ["anyhow", "extension-module", "generate-import-lib"] }
+
+[target.'cfg(any(target_os = "freebsd", target_os = "windows"))'.dependencies]
+mimalloc = { version = "0.1.43", default-features = false, features = ["local_dynamic_tls"] }
+
+[target.'cfg(not(any(target_os = "freebsd", target_os = "windows")))'.dependencies]
+tikv-jemallocator = { version = "0.6.0", default-features = false, features = ["disable_initial_exec_tls"] }
+
+[profile.release]
+codegen-units = 1
+debug = false
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true

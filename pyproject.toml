@@ -1,0 +1,98 @@
+[project]
+name = 'rloop'
+authors = [
+    { name = 'Giovanni Barillari', email = 'g@baro.dev' }
+]
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: BSD License',
+    'Operating System :: MacOS',
+    'Operating System :: Microsoft :: Windows',
+    'Operating System :: POSIX :: Linux',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: Implementation :: CPython',
+    'Programming Language :: Python :: Implementation :: PyPy',
+    'Programming Language :: Python',
+    'Programming Language :: Rust',
+]
+
+dynamic = [
+    'description',
+    'keywords',
+    'license',
+    'readme',
+    'version',
+]
+
+requires-python = '>=3.9'
+dependencies = []
+
+[project.optional-dependencies]
+lint = [
+    'ruff~=0.5.0',
+]
+test = [
+    'pytest~=7.4.2',
+    'pytest-asyncio~=0.21.1',
+]
+dev = ['rloop[lint,test]']
+
+[project.urls]
+Homepage = 'https://github.com/gi0baro/rloop'
+Funding = 'https://github.com/sponsors/gi0baro'
+Source = 'https://github.com/gi0baro/rloop'
+
+[build-system]
+requires = ['maturin>=1.1.0,<2']
+build-backend = 'maturin'
+
+[tool.maturin]
+module-name = 'rloop._rloop'
+bindings = 'pyo3'
+
+[tool.ruff]
+line-length = 120
+extend-select = [
+    # E and F are enabled by default
+    'B',      # flake8-bugbear
+    'C4',     # flake8-comprehensions
+    'C90',    # mccabe
+    'I',      # isort
+    'N',      # pep8-naming
+    'Q',      # flake8-quotes
+    'RUF100', # ruff (unused noqa)
+    'S',      # flake8-bandit
+    'W',      # pycodestyle
+]
+extend-ignore = [
+    'B008', # function calls in args defaults are fine
+    'B009', # getattr with constants is fine
+    'B034', # re.split won't confuse us
+    'B904', # rising without from is fine
+    'E501', # leave line length to black
+    'N818', # leave to us exceptions naming
+    'S101', # assert is fine
+]
+flake8-quotes = { inline-quotes = 'single', multiline-quotes = 'double' }
+mccabe = { max-complexity = 16 }
+
+[tool.ruff.format]
+quote-style = 'single'
+
+[tool.ruff.isort]
+combine-as-imports = true
+lines-after-imports = 2
+known-first-party = ['rloop', 'tests']
+
+[tool.ruff.per-file-ignores]
+'rloop/_rloop.pyi' = ['I001']
+'tests/**' = ['B018', 'S110', 'S501']
+
+[tool.pytest.ini_options]
+asyncio_mode = 'auto'
