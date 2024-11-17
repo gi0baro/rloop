@@ -12,7 +12,7 @@ from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather
 from contextvars import copy_context as _copy_context
 from typing import Union
 
-from ._compat import _PYV, _PY_311
+from ._compat import _PY_311, _PYV
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .utils import _HAS_IPv6, _ipaddr_info
@@ -190,6 +190,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         return _Future(loop=self)
 
     if _PYV >= _PY_311:
+
         def create_task(self, coro, *, name=None, context=None) -> _Task:
             self._check_closed()
             if self._task_factory is None:
@@ -207,6 +208,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
             return task
     else:
+
         def create_task(self, coro, *, name=None, context=None) -> _Task:
             self._check_closed()
             if self._task_factory is None:
