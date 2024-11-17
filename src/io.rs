@@ -1,9 +1,10 @@
 use mio::{
     event::Source as MioSource,
     net::{TcpListener, TcpStream},
-    unix::SourceFd,
     Token,
 };
+#[cfg(unix)]
+use mio::unix::SourceFd;
 #[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(windows)]
