@@ -12,6 +12,7 @@ from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather
 from contextvars import copy_context as _copy_context
 from typing import Union
 
+from ._compat import _PYV, _PY_311
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .utils import _HAS_IPv6, _ipaddr_info
@@ -188,22 +189,40 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def create_future(self) -> _Future:
         return _Future(loop=self)
 
-    def create_task(self, coro, *, name=None, context=None) -> _Task:
-        self._check_closed()
-        if self._task_factory is None:
-            task = _Task(coro, loop=self, context=context)
-            if task._source_traceback:
-                del task._source_traceback[-1]
-        else:
-            if context is None:
-                # Use legacy API if context is not needed
-                task = self._task_factory(self, coro)
+    if _PYV >= _PY_311:
+        def create_task(self, coro, *, name=None, context=None) -> _Task:
+            self._check_closed()
+            if self._task_factory is None:
+                task = _Task(coro, loop=self, name=name, context=context)
+                if task._source_traceback:
+                    del task._source_traceback[-1]
             else:
-                task = self._task_factory(self, coro, context=context)
+                if context is None:
+                    # Use legacy API if context is not needed
+                    task = self._task_factory(self, coro)
+                else:
+                    task = self._task_factory(self, coro, context=context)
 
-            task.set_name(name)
+                task.set_name(name)
 
-        return task
+            return task
+    else:
+        def create_task(self, coro, *, name=None, context=None) -> _Task:
+            self._check_closed()
+            if self._task_factory is None:
+                task = _Task(coro, loop=self, name=name)
+                if task._source_traceback:
+                    del task._source_traceback[-1]
+            else:
+                if context is None:
+                    # Use legacy API if context is not needed
+                    task = self._task_factory(self, coro)
+                else:
+                    task = self._task_factory(self, coro, context=context)
+
+                task.set_name(name)
+
+            return task
 
     #: threads methods
     def call_soon_threadsafe(self, callback, *args, context=None) -> CBHandle:
