@@ -25,17 +25,18 @@ pub(crate) enum Source {
 #[derive(Debug)]
 pub struct SourceRawSocket<'a>(pub &'a RawSocket);
 
+// NOTE: this won't work as `selector()` is not exposed on win
 #[cfg(windows)]
 impl<'a> MioSource for SourceRawSocket<'a> {
-    fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
+    fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         registry.selector().register(*self.0, token, interests)
     }
 
-    fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
+    fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         registry.selector().reregister(*self.0, token, interests)
     }
 
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    fn deregister(&mut self, registry: &Registry) -> std::io::Result<()> {
         registry.selector().deregister(*self.0)
     }
 }

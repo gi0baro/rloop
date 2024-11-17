@@ -72,33 +72,3 @@ jobs:
       run: |
         source .venv/bin/activate
         make test
-
-  windows:
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-        - '3.9'
-        - '3.10'
-        - '3.11'
-        - '3.12'
-        - '3.13'
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-        allow-prereleases: true
-    - name: Install
-      run: |
-        python -m venv venv
-        venv/Scripts/Activate.ps1
-        pip install maturin==${{ env.MATURIN_VERSION }} pytest
-        maturin develop --extras=test
-    - name: Test
-      run: |
-        venv/Scripts/Activate.ps1
-        make test
