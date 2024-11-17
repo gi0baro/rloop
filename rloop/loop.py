@@ -191,7 +191,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def create_task(self, coro, *, name=None, context=None) -> _Task:
         self._check_closed()
         if self._task_factory is None:
-            task = _Task(coro, loop=self, name=name, context=context)
+            task = _Task(coro, loop=self, context=context)
             if task._source_traceback:
                 del task._source_traceback[-1]
         else:
