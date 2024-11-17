@@ -1,10 +1,10 @@
+#[cfg(unix)]
+use mio::unix::SourceFd;
 use mio::{
     event::Source as MioSource,
     net::{TcpListener, TcpStream},
-    Token,
+    Interest, Registry, Token,
 };
-#[cfg(unix)]
-use mio::unix::SourceFd;
 #[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(windows)]
@@ -42,7 +42,7 @@ impl<'a> MioSource for SourceRawSocket<'a> {
 
 impl MioSource for Source {
     #[inline]
-    fn register(&mut self, registry: &mio::Registry, token: Token, interests: mio::Interest) -> std::io::Result<()> {
+    fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         match self {
             Self::TCPListener(inner) => inner.register(registry, token, interests),
             Self::TCPStream(inner) => inner.register(registry, token, interests),
@@ -54,7 +54,7 @@ impl MioSource for Source {
     }
 
     #[inline]
-    fn reregister(&mut self, registry: &mio::Registry, token: Token, interests: mio::Interest) -> std::io::Result<()> {
+    fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         match self {
             Self::TCPListener(inner) => inner.reregister(registry, token, interests),
             Self::TCPStream(inner) => inner.reregister(registry, token, interests),
@@ -66,7 +66,7 @@ impl MioSource for Source {
     }
 
     #[inline]
-    fn deregister(&mut self, registry: &mio::Registry) -> std::io::Result<()> {
+    fn deregister(&mut self, registry: &Registry) -> std::io::Result<()> {
         match self {
             Self::TCPListener(inner) => inner.deregister(registry),
             Self::TCPStream(inner) => inner.deregister(registry),
