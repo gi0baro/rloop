@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    target-branch: "master"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+  - package-ecosystem: "cargo"
+    target-branch: "master"
+    directory: "/"
+    schedule:
+      interval: "monthly"
