@@ -1,10 +1,13 @@
 import asyncio as __asyncio
+import errno
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import traceback
 import warnings
+from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture
 from asyncio.log import logger as _aio_logger
@@ -33,17 +36,19 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         # self._set_coroutine_origin_tracking(self._debug)
 
         _old_agen_hooks = sys.get_asyncgen_hooks()
-        self._thread_id = threading.get_ident()
         sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook, finalizer=self._asyncgen_finalizer_hook)
 
+        self._thread_id = threading.get_ident()
+        self._signals_resume()
         _set_running_loop(self)
 
         return _old_agen_hooks
 
     def _run_forever_post(self, _old_agen_hooks):
-        self._stopping = False
-        self._thread_id = 0
         _set_running_loop(None)
+        self._signals_pause()
+        self._thread_id = 0
+        self._stopping = False
         # self._set_coroutine_origin_tracking(False)
         # Restore any pre-existing async generator hooks.
         if _old_agen_hooks is not None:
@@ -114,6 +119,9 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         # if self._debug:
         #     logger.debug("Close %r", self)
         self._closed = True
+
+        self._signals_clear()
+
         self._executor_shutdown_called = True
         executor = self._default_executor
         if executor is not None:
@@ -541,10 +549,129 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     #: signals
     def add_signal_handler(self, sig, callback, *args):
-        raise NotImplementedError
+        if not self.__is_main_thread():
+            raise ValueError('Signals can only be handled from the main thread')
+
+        if _iscoroutine(callback) or _iscoroutinefunction(callback):
+            raise TypeError('Coroutines cannot be used as signals handlers')
+
+        self._check_closed()
+        self._sig_add(sig, callback, _copy_context())
+        try:
+            # register a dummy signal handler so Python will write the signal no in the wakeup fd
+            signal.signal(sig, self.__sighandler)
+            # set SA_RESTART to limit EINTR occurrences
+            signal.siginterrupt(sig, False)
+        except OSError as exc:
+            self._sig_rem(sig)
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f'signum {sig} cannot be caught')
+            raise
 
     def remove_signal_handler(self, sig):
-        raise NotImplementedError
+        if not self._is_main_thread():
+            raise ValueError('Signals can only be handled from the main thread')
+
+        return self._sig_rem(sig)
+
+    def __is_main_thread(self):
+        return threading.main_thread().ident == threading.current_thread().ident
+
+    def __sighandler(self, signum, frame):
+        self._signals.add(signum)
+
+    def __set_sig_wfd(self, fd):
+        if fd >= 0:
+            return signal.set_wakeup_fd(fd, warn_on_full_buffer=False)
+        return signal.set_wakeup_fd(fd)
+
+    def _signals_resume(self):
+        if not self.__is_main_thread():
+            return
+
+        if self._sig_listening or (self._ssock_r is not None):
+            raise RuntimeError('Signals handling has been already setup')
+
+        self._ssock_r, self._ssock_w = socket.socketpair()
+        try:
+            self._ssock_r.setblocking(False)
+            self._ssock_w.setblocking(False)
+
+            fd = self._ssock_w.fileno()
+            self._sig_wfd = self.__set_sig_wfd(fd)
+        except Exception:
+            self._ssock_w.close()
+            self._ssock_r.close()
+            self._ssock_w = None
+            self._ssock_r = None
+            raise
+
+        self._reader_add(self._ssock_r.fileno(), self._ssock_reader, (), _copy_context())
+        self._sig_listening = True
+
+    def _signals_pause(self):
+        if not self.__is_main_thread():
+            if self._sig_listening:
+                raise RuntimeError('Cannot pause signals handling outside of the main thread')
+            return
+
+        if not self._sig_listening:
+            raise RuntimeError('Signals handling has not been setup')
+
+        self._sig_listening = False
+
+        self.__set_sig_wfd(self._sig_wfd)
+        self._reader_rem(self._ssock_r.fileno())
+        self._ssock_w.close()
+        self._ssock_r.close()
+        self._ssock_w = None
+        self._ssock_r = None
+
+    def _signals_clear(self):
+        if not self.__is_main_thread():
+            return
+
+        if self._sig_listening:
+            raise RuntimeError('Cannot clear signals handling while listening')
+
+        if self._ssock_r:
+            raise RuntimeError('Signals handling was not cleaned up')
+
+        self._sig_clear()
+
+    def _signals_invoke(self, data):
+        self._sig_ceval(lambda: None)
+        self._sig_loop_handled = True
+
+        sigs = self._signals.copy()
+        self._signals.clear()
+        for signum in data:
+            if not signum:
+                continue
+            sigs.discard(signum)
+            self._signal_handle(signum)
+
+        for signum in sigs:
+            self._signal_handle(signum)
+
+    def _signal_handle(self, signum):
+        if not self._sig_handle(signum):
+            self._sig_ceval(lambda: None)
+
+    def _ssock_reader(self):
+        sigdata = b''
+        while True:
+            try:
+                data = self._ssock_r.recv(65536)
+                if not data:
+                    break
+                sigdata += data
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                break
+        if sigdata:
+            self._signals_invoke(sigdata)
 
     #: task factory
     def set_task_factory(self, factory):
