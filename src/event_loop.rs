@@ -60,6 +60,9 @@ struct EventLoop {
     handles_ready: Arc<Mutex<VecDeque<Py<CBHandle>>>>,
     handles_sched: Arc<Mutex<BinaryHeap<Timer>>>,
     epoch: Instant,
+    counter_ready: atomic::AtomicUsize,
+    counter_io: atomic::AtomicU16,
+    tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
     stopping: atomic::AtomicBool,
     shutdown_called_asyncgens: atomic::AtomicBool,
@@ -78,21 +81,26 @@ struct EventLoop {
 
 impl EventLoop {
     #[inline]
-    fn _step(&self, py: Python) -> std::result::Result<(), std::io::Error> {
+    fn step(&self, py: Python) -> std::result::Result<(), std::io::Error> {
         let mut io_events = Events::with_capacity(128);
         let mut sched_time: Option<u64> = None;
+        let mut skip_poll = false;
 
         // compute poll timeout based on scheduled work
-        // TODO: do we need the stopping one given we check for it in the outer loop?
-        // if self._stopping.load(atomic::Ordering::Relaxed) {
-        //     sched_time = Some(0);
-        // } else {
-        let has_ready_work = {
-            let guard_cb = self.handles_ready.lock().unwrap();
-            guard_cb.len() > 0
-        };
-        if has_ready_work {
+        if self.counter_ready.load(atomic::Ordering::Relaxed) > 0 {
             sched_time = Some(0);
+            // we want to skip polling when unnecessary:
+            //   if we have I/O handles, we need to check the time since last poll
+            //   otherwise we don't need to poll at all
+            if self.counter_io.load(atomic::Ordering::Relaxed) > 0 {
+                // we max out at 250μs poll intervals
+                let tick = Instant::now().duration_since(self.epoch).as_micros() as u64;
+                if (tick - self.tick_last_poll.load(atomic::Ordering::Relaxed)) < 250 {
+                    skip_poll = true;
+                }
+            } else {
+                skip_poll = true;
+            }
         } else {
             let guard_sched = self.handles_sched.lock().unwrap();
             if let Some(timer) = guard_sched.peek() {
@@ -106,11 +114,21 @@ impl EventLoop {
         }
 
         // I/O
-        let poll_result = py.allow_threads(|| {
-            let mut io = self.io.lock().unwrap();
-            io.poll(&mut io_events, sched_time.map(Duration::from_millis))
-        });
+        let poll_result = match skip_poll {
+            true => Ok(()),
+            false => py.allow_threads(|| {
+                let mut io = self.io.lock().unwrap();
+                let res = io.poll(&mut io_events, sched_time.map(Duration::from_millis));
+                self.tick_last_poll.store(
+                    Instant::now().duration_since(self.epoch).as_micros() as u64,
+                    atomic::Ordering::Relaxed,
+                );
+                res
+            }),
+        };
         let mut guard_cb = self.handles_ready.lock().unwrap();
+        self.counter_ready.fetch_sub(guard_cb.len(), atomic::Ordering::Relaxed);
+
         for event in &io_events {
             // NOTE: cancellation is not necessary as we have custom futures
             if let Some(handle) = self.handles_io.get(&event.token()) {
@@ -178,7 +196,10 @@ impl EventLoop {
         if let Some((_, mut item)) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
             match item.interest {
-                Interest::READABLE => guard_poll.registry().deregister(&mut item.source)?,
+                Interest::READABLE => {
+                    self.counter_io.fetch_sub(1, atomic::Ordering::Relaxed);
+                    guard_poll.registry().deregister(&mut item.source)?;
+                }
                 _ => {
                     let interest = Interest::WRITABLE;
                     guard_poll.registry().reregister(&mut item.source, token, interest)?;
@@ -203,7 +224,10 @@ impl EventLoop {
         if let Some((_, mut item)) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
             match item.interest {
-                Interest::WRITABLE => guard_poll.registry().deregister(&mut item.source)?,
+                Interest::WRITABLE => {
+                    self.counter_io.fetch_sub(1, atomic::Ordering::Relaxed);
+                    guard_poll.registry().deregister(&mut item.source)?;
+                }
                 _ => {
                     let interest = Interest::READABLE;
                     guard_poll.registry().reregister(&mut item.source, token, interest)?;
@@ -234,6 +258,9 @@ impl EventLoop {
             handles_ready: Arc::new(Mutex::new(VecDeque::with_capacity(128))),
             handles_sched: Arc::new(Mutex::new(BinaryHeap::with_capacity(32))),
             epoch: Instant::now(),
+            counter_ready: atomic::AtomicUsize::new(0),
+            counter_io: atomic::AtomicU16::new(0),
+            tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
             stopping: atomic::AtomicBool::new(false),
             shutdown_called_asyncgens: atomic::AtomicBool::new(false),
@@ -317,6 +344,7 @@ impl EventLoop {
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
         let mut guard = self.handles_ready.lock().unwrap();
         guard.push_back(handle.clone_ref(py));
+        self.counter_ready.fetch_add(1, atomic::Ordering::Relaxed);
         drop(guard);
         Ok(handle)
     }
@@ -372,6 +400,7 @@ impl EventLoop {
                         cbw: None,
                     },
                 );
+                self.counter_io.fetch_add(1, atomic::Ordering::Relaxed);
             }
         }
         Ok(handle)
@@ -416,6 +445,7 @@ impl EventLoop {
                         cbw: Some(handle.clone_ref(py)),
                     },
                 );
+                self.counter_io.fetch_add(1, atomic::Ordering::Relaxed);
             }
         }
         Ok(handle)
@@ -431,7 +461,7 @@ impl EventLoop {
             if self.stopping.load(atomic::Ordering::Relaxed) {
                 break;
             }
-            if let Err(err) = self._step(py) {
+            if let Err(err) = self.step(py) {
                 return Err(err.into());
             }
         }
