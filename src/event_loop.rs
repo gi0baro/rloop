@@ -9,7 +9,10 @@ use std::{
 use anyhow::Result;
 use dashmap::DashMap;
 use mio::{Events, Interest, Poll, Token};
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::{
+    prelude::*,
+    types::{PyDict, PySet, PyTuple},
+};
 
 use crate::handles::{CBHandle, TimerHandle};
 use crate::io::Source;
@@ -64,9 +67,15 @@ struct EventLoop {
     counter_io: atomic::AtomicU16,
     tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
+    sig_handlers: Arc<DashMap<u16, Py<CBHandle>>>,
+    sig_listening: atomic::AtomicBool,
+    sig_loop_handled: atomic::AtomicBool,
+    sig_wfd: Arc<RwLock<PyObject>>,
     stopping: atomic::AtomicBool,
     shutdown_called_asyncgens: atomic::AtomicBool,
     shutdown_called_executor: atomic::AtomicBool,
+    ssock_r: Arc<RwLock<PyObject>>,
+    ssock_w: Arc<RwLock<PyObject>>,
     task_factory: Arc<RwLock<PyObject>>,
     thread_id: atomic::AtomicI64,
     #[pyo3(get)]
@@ -77,6 +86,8 @@ struct EventLoop {
     _default_executor: PyObject,
     #[pyo3(get)]
     _exception_handler: PyObject,
+    #[pyo3(get)]
+    _signals: PyObject,
 }
 
 impl EventLoop {
@@ -92,7 +103,8 @@ impl EventLoop {
             // we want to skip polling when unnecessary:
             //   if we have I/O handles, we need to check the time since last poll
             //   otherwise we don't need to poll at all
-            if self.counter_io.load(atomic::Ordering::Relaxed) > 0 {
+            // NOTE: >1 as we always have signal socket reader
+            if self.counter_io.load(atomic::Ordering::Relaxed) > 1 {
                 // we max out at 250μs poll intervals
                 let tick = Instant::now().duration_since(self.epoch).as_micros() as u64;
                 if (tick - self.tick_last_poll.load(atomic::Ordering::Relaxed)) < 250 {
@@ -119,6 +131,12 @@ impl EventLoop {
             false => py.allow_threads(|| {
                 let mut io = self.io.lock().unwrap();
                 let res = io.poll(&mut io_events, sched_time.map(Duration::from_millis));
+                if let Err(ref err) = res {
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        // if we got an interrupt, we retry ready events (as we might need to process signals)
+                        let _ = io.poll(&mut io_events, Some(Duration::from_millis(0)));
+                    }
+                }
                 self.tick_last_poll.store(
                     Instant::now().duration_since(self.epoch).as_micros() as u64,
                     atomic::Ordering::Relaxed,
@@ -133,17 +151,11 @@ impl EventLoop {
             // NOTE: cancellation is not necessary as we have custom futures
             if let Some(handle) = self.handles_io.get(&event.token()) {
                 if let Some(cbr) = &handle.cbr {
-                    // if event.is_readable() && !cbr.get().cancelled.load(atomic::Ordering::Relaxed) {
-                    //     guard_cb.push_back(cbr.clone_ref(py));
-                    // }
                     if event.is_readable() {
                         guard_cb.push_back(cbr.clone_ref(py));
                     }
                 }
                 if let Some(cbw) = &handle.cbw {
-                    // if event.is_writable() && !cbw.get().cancelled.load(atomic::Ordering::Relaxed) {
-                    //     guard_cb.push_back(cbw.clone_ref(py));
-                    // }
                     if event.is_writable() {
                         guard_cb.push_back(cbw.clone_ref(py));
                     }
@@ -262,27 +274,28 @@ impl EventLoop {
             counter_io: atomic::AtomicU16::new(0),
             tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
+            sig_handlers: Arc::new(DashMap::with_capacity(32)),
+            sig_listening: atomic::AtomicBool::new(false),
+            sig_loop_handled: atomic::AtomicBool::new(false),
+            sig_wfd: Arc::new(RwLock::new(py.None())),
             stopping: atomic::AtomicBool::new(false),
             shutdown_called_asyncgens: atomic::AtomicBool::new(false),
             shutdown_called_executor: atomic::AtomicBool::new(false),
+            ssock_r: Arc::new(RwLock::new(py.None())),
+            ssock_w: Arc::new(RwLock::new(py.None())),
             task_factory: Arc::new(RwLock::new(py.None())),
             thread_id: atomic::AtomicI64::new(0),
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
             _default_executor: py.None(),
             _exception_handler: py.None(),
+            _signals: PySet::empty_bound(py)?.into_py(py),
         })
     }
 
-    #[getter(_task_factory)]
-    fn _get_task_factory(&self, py: Python) -> PyObject {
-        self.task_factory.read().unwrap().clone_ref(py)
-    }
-
-    #[setter(_task_factory)]
-    fn _set_task_factory(&self, factory: PyObject) {
-        let mut guard = self.task_factory.write().unwrap();
-        *guard = factory;
+    #[getter(_clock)]
+    fn _get_clock(&self) -> u128 {
+        Instant::now().duration_since(self.epoch).as_micros()
     }
 
     #[getter(_thread_id)]
@@ -335,9 +348,68 @@ impl EventLoop {
         self.shutdown_called_executor.store(val, atomic::Ordering::Relaxed);
     }
 
-    #[getter(_clock)]
-    fn _get_clock(&self) -> u128 {
-        Instant::now().duration_since(self.epoch).as_micros()
+    #[getter(_sig_listening)]
+    fn _get_sig_listening(&self) -> bool {
+        self.sig_listening.load(atomic::Ordering::Relaxed)
+    }
+
+    #[setter(_sig_listening)]
+    fn _set_sig_listening(&self, val: bool) {
+        self.sig_listening.store(val, atomic::Ordering::Relaxed);
+    }
+
+    #[getter(_sig_loop_handled)]
+    fn _get_sig_loop_handled(&self) -> bool {
+        self.sig_loop_handled.load(atomic::Ordering::Relaxed)
+    }
+
+    #[setter(_sig_loop_handled)]
+    fn _set_sig_loop_handled(&self, val: bool) {
+        self.sig_loop_handled.store(val, atomic::Ordering::Relaxed);
+    }
+
+    #[getter(_sig_wfd)]
+    fn _get_sig_wfd(&self, py: Python) -> PyObject {
+        self.sig_wfd.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_sig_wfd)]
+    fn _set_sig_wfd(&self, val: PyObject) {
+        let mut guard = self.sig_wfd.write().unwrap();
+        *guard = val;
+    }
+
+    #[getter(_ssock_r)]
+    fn _get_ssock_r(&self, py: Python) -> PyObject {
+        self.ssock_r.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_ssock_r)]
+    fn _set_ssock_r(&self, val: PyObject) {
+        let mut guard = self.ssock_r.write().unwrap();
+        *guard = val;
+    }
+
+    #[getter(_ssock_w)]
+    fn _get_ssock_w(&self, py: Python) -> PyObject {
+        self.ssock_w.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_ssock_w)]
+    fn _set_ssock_w(&self, val: PyObject) {
+        let mut guard = self.ssock_w.write().unwrap();
+        *guard = val;
+    }
+
+    #[getter(_task_factory)]
+    fn _get_task_factory(&self, py: Python) -> PyObject {
+        self.task_factory.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_task_factory)]
+    fn _set_task_factory(&self, factory: PyObject) {
+        let mut guard = self.task_factory.write().unwrap();
+        *guard = factory;
     }
 
     fn _call_soon(&self, py: Python, callback: PyObject, args: PyObject, context: PyObject) -> PyResult<Py<CBHandle>> {
@@ -456,12 +528,48 @@ impl EventLoop {
         self.writer_rem(token)
     }
 
+    fn _sig_add(&self, py: Python, sig: u16, callback: PyObject, context: PyObject) -> Result<()> {
+        let args = PyTuple::empty_bound(py).into_py(py);
+        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
+        self.sig_handlers.insert(sig, handle);
+        Ok(())
+    }
+
+    fn _sig_rem(&self, sig: u16) -> bool {
+        self.sig_handlers.remove(&sig).is_some()
+    }
+
+    fn _sig_clear(&self) {
+        self.sig_handlers.clear();
+    }
+
+    fn _sig_handle(&self, py: Python, sig: u16) -> bool {
+        if let Some(handle) = self.sig_handlers.get(&sig) {
+            handle.get().run(py);
+            return true;
+        }
+        false
+    }
+
+    fn _sig_ceval(&self, noop: PyObject) {
+        let noop_ptr = noop.as_ptr();
+        unsafe {
+            pyo3::ffi::PyErr_CheckSignals();
+            pyo3::ffi::PyObject_CallNoArgs(noop_ptr);
+        }
+    }
+
     fn _run(&self, py: Python) -> PyResult<()> {
         loop {
             if self.stopping.load(atomic::Ordering::Relaxed) {
                 break;
             }
             if let Err(err) = self.step(py) {
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    && self.sig_loop_handled.swap(false, atomic::Ordering::Relaxed)
+                {
+                    continue;
+                }
                 return Err(err.into());
             }
         }
