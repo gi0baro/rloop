@@ -32,6 +32,7 @@ class EventLoop:
     _stopping: bool
     _task_factory: Any
     _thread_id: int
+    _watcher_child: Any
 
     def _run(self): ...
     def _wake(self): ...

@@ -84,6 +84,7 @@ struct EventLoop {
     ssock_w: Arc<RwLock<PyObject>>,
     task_factory: Arc<RwLock<PyObject>>,
     thread_id: atomic::AtomicI64,
+    watcher_child: Arc<RwLock<PyObject>>,
     #[pyo3(get)]
     _asyncgens: PyObject,
     #[pyo3(get)]
@@ -305,6 +306,7 @@ impl EventLoop {
             ssock_w: Arc::new(RwLock::new(py.None())),
             task_factory: Arc::new(RwLock::new(py.None())),
             thread_id: atomic::AtomicI64::new(0),
+            watcher_child: Arc::new(RwLock::new(py.None())),
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
             _signals: PySet::empty_bound(py)?.into_py(py),
@@ -460,6 +462,17 @@ impl EventLoop {
     #[setter(_task_factory)]
     fn _set_task_factory(&self, factory: PyObject) {
         let mut guard = self.task_factory.write().unwrap();
+        *guard = factory;
+    }
+
+    #[getter(_watcher_child)]
+    fn _get_watcher_child(&self, py: Python) -> PyObject {
+        self.watcher_child.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_watcher_child)]
+    fn _set_watcher_child(&self, factory: PyObject) {
+        let mut guard = self.watcher_child.write().unwrap();
         *guard = factory;
     }
 

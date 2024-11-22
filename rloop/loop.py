@@ -18,13 +18,21 @@ from ._compat import _PY_311, _PYV
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
 from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
-from .utils import _HAS_IPv6, _ipaddr_info
+from .subprocess import (
+    _PidfdChildWatcher,
+    _PipeReadTransport,
+    _PipeWriteTransport,
+    _SubProcessTransport,
+    _ThreadedChildWatcher,
+)
+from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def __init__(self):
         super().__init__()
         self._exc_handler = _exception_handler
+        self._watcher_child = _PidfdChildWatcher(self) if _can_use_pidfd() else _ThreadedChildWatcher(self)
 
     #: running methods
     def run_forever(self):
@@ -399,20 +407,91 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     #: pipes and subprocesses methods
     async def connect_read_pipe(self, protocol_factory, pipe):
-        raise NotImplementedError
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        transport = _PipeReadTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
 
     async def connect_write_pipe(self, protocol_factory, pipe):
-        raise NotImplementedError
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        transport = _PipeWriteTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
 
-    async def subprocess_shell(
+    def subprocess_shell(
         self, protocol_factory, cmd, *, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
     ):
-        raise NotImplementedError
+        return self.__subprocess_run(  # noqa: S604
+            protocol_factory, (cmd,), stdin=stdin, stdout=stdout, stderr=stderr, shell=True, **kwargs
+        )
 
-    async def subprocess_exec(
+    def subprocess_exec(
         self, protocol_factory, *args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
     ):
-        raise NotImplementedError
+        return self.__subprocess_run(
+            protocol_factory, args, stdin=stdin, stdout=stdout, stderr=stderr, shell=False, **kwargs
+        )
+
+    async def __subprocess_run(
+        self,
+        protocol_factory,
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        bufsize=0,
+        universal_newlines=False,
+        executable=None,
+        **kwargs,
+    ):
+        if universal_newlines:
+            raise ValueError('universal_newlines not supported')
+        if bufsize != 0:
+            raise ValueError('bufsize must be 0')
+
+        if executable is not None:
+            args[0] = executable
+
+        waiter = self.create_future()
+        proto = protocol_factory()
+        transp = _SubProcessTransport(
+            self,
+            proto,
+            args,
+            shell=shell,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            bufsize=bufsize,
+            waiter=waiter,
+            **kwargs,
+        )
+        self._watcher_child.add_child_handler(transp.get_pid(), self._child_watcher_callback, transp)
+
+        try:
+            await waiter
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            transp.close()
+            await transp._wait()
+            raise
+
+        return transp, proto
+
+    def _child_watcher_callback(self, pid, returncode, transp):
+        self.call_soon_threadsafe(transp._process_exited, returncode)
 
     #: ready-based callback registration methods
     def add_reader(self, fd, callback, *args) -> CBHandle:
