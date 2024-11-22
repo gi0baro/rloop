@@ -67,6 +67,8 @@ struct EventLoop {
     counter_io: atomic::AtomicU16,
     tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
+    exc_handler: Arc<RwLock<PyObject>>,
+    exception_handler: Arc<RwLock<PyObject>>,
     sig_handlers: Arc<DashMap<u16, Py<CBHandle>>>,
     sig_listening: atomic::AtomicBool,
     sig_loop_handled: atomic::AtomicBool,
@@ -84,8 +86,6 @@ struct EventLoop {
     _base_ctx: PyObject,
     #[pyo3(get)]
     _default_executor: PyObject,
-    #[pyo3(get)]
-    _exception_handler: PyObject,
     #[pyo3(get)]
     _signals: PyObject,
 }
@@ -193,9 +193,10 @@ impl EventLoop {
                     let err_ctx = PyDict::new_bound(py);
                     err_ctx.set_item(pyo3::intern!(py, "exception"), err).unwrap();
                     err_ctx.set_item(pyo3::intern!(py, "message"), msg).unwrap();
-                    // err_ctx.set_item(pyo3::intern!(py, "handle"), cb_handle.clone_ref(py)).unwrap();
-
-                    // TODO: how to call exception handler?
+                    err_ctx
+                        .set_item(pyo3::intern!(py, "handle"), cb_handle.clone_ref(py))
+                        .unwrap();
+                    let _ = self.log_exception(py, err_ctx);
                 }
             }
         }
@@ -258,6 +259,11 @@ impl EventLoop {
         }
         Ok(false)
     }
+
+    fn log_exception(&self, py: Python, ctx: Bound<PyDict>) -> PyResult<PyObject> {
+        let handler = self.exc_handler.read().unwrap();
+        handler.call1(py, (ctx, self.exception_handler.read().unwrap().clone_ref(py)))
+    }
 }
 
 #[pymethods]
@@ -274,6 +280,8 @@ impl EventLoop {
             counter_io: atomic::AtomicU16::new(0),
             tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
+            exc_handler: Arc::new(RwLock::new(py.None())),
+            exception_handler: Arc::new(RwLock::new(py.None())),
             sig_handlers: Arc::new(DashMap::with_capacity(32)),
             sig_listening: atomic::AtomicBool::new(false),
             sig_loop_handled: atomic::AtomicBool::new(false),
@@ -288,7 +296,6 @@ impl EventLoop {
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
             _default_executor: py.None(),
-            _exception_handler: py.None(),
             _signals: PySet::empty_bound(py)?.into_py(py),
         })
     }
@@ -336,6 +343,28 @@ impl EventLoop {
     #[setter(_asyncgens_shutdown_called)]
     fn _set_asyncgens_shutdown_called(&self, val: bool) {
         self.shutdown_called_asyncgens.store(val, atomic::Ordering::Relaxed);
+    }
+
+    #[getter(_exc_handler)]
+    fn _get_exc_handler(&self, py: Python) -> PyObject {
+        self.exc_handler.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_exc_handler)]
+    fn _set_exc_handler(&self, val: PyObject) {
+        let mut guard = self.exc_handler.write().unwrap();
+        *guard = val;
+    }
+
+    #[getter(_exception_handler)]
+    fn _get_exception_handler(&self, py: Python) -> PyObject {
+        self.exception_handler.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_exception_handler)]
+    fn _set_exception_handler(&self, val: PyObject) {
+        let mut guard = self.exception_handler.write().unwrap();
+        *guard = val;
     }
 
     #[getter(_executor_shutdown_called)]

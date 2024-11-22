@@ -5,23 +5,26 @@ import socket
 import subprocess
 import sys
 import threading
-import traceback
 import warnings
 from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture
-from asyncio.log import logger as _aio_logger
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
 from contextvars import copy_context as _copy_context
 from typing import Union
 
 from ._compat import _PY_311, _PYV
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
+from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .utils import _HAS_IPv6, _ipaddr_info
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
+    def __init__(self):
+        super().__init__()
+        self._exc_handler = _exception_handler
+
     #: running methods
     def run_forever(self):
         try:
@@ -687,77 +690,8 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def set_exception_handler(self, handler):
         self._exception_handler = handler
 
-    def default_exception_handler(self, context):
-        message = context.get('message')
-        if not message:
-            message = 'Unhandled exception in event loop'
-
-        exception = context.get('exception')
-        if exception is not None:
-            exc_info = (type(exception), exception, exception.__traceback__)
-        else:
-            exc_info = False
-
-        # if ('source_traceback' not in context and
-        #         self._current_handle is not None and
-        #         self._current_handle._source_traceback):
-        #     context['handle_traceback'] = \
-        #         self._current_handle._source_traceback
-
-        log_lines = [message]
-        for key in sorted(context):
-            if key in {'message', 'exception'}:
-                continue
-            value = context[key]
-            if key == 'source_traceback':
-                tb = ''.join(traceback.format_list(value))
-                value = 'Object created at (most recent call last):\n'
-                value += tb.rstrip()
-            elif key == 'handle_traceback':
-                tb = ''.join(traceback.format_list(value))
-                value = 'Handle created at (most recent call last):\n'
-                value += tb.rstrip()
-            else:
-                value = repr(value)
-            log_lines.append(f'{key}: {value}')
-
-        _aio_logger.error('\n'.join(log_lines), exc_info=exc_info)
-
     def call_exception_handler(self, context):
-        if self._exception_handler is None:
-            try:
-                self.default_exception_handler(context)
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException:
-                _aio_logger.error('Exception in default exception handler', exc_info=True)
-        else:
-            try:
-                self._exception_handler(self, context)
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as exc:
-                # Exception in the user set custom exception handler.
-                try:
-                    # Let's try default handler.
-                    self.default_exception_handler(
-                        {
-                            'message': 'Unhandled error in exception handler',
-                            'exception': exc,
-                            'context': context,
-                        }
-                    )
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException:
-                    # Guard 'default_exception_handler' in case it is
-                    # overloaded.
-                    _aio_logger.error(
-                        'Exception in default exception handler '
-                        'while handling an unexpected error '
-                        'in custom exception handler',
-                        exc_info=True,
-                    )
+        return self._exc_handler(context, self._exception_handler)
 
     #: debug management
     def get_debug(self) -> bool:

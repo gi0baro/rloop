@@ -38,6 +38,7 @@ impl CBHandle {
         };
 
         if let Err(err) = res {
+            // TODO: better format for callback repr
             let msg = format!("Exception in callback {:?}", self.callback);
             return Some((err, msg));
         }
