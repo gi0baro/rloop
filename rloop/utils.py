@@ -1,7 +1,20 @@
+import os
 import socket
 
 
 _HAS_IPv6 = hasattr(socket, 'AF_INET6')
+
+
+def _can_use_pidfd():
+    if not hasattr(os, 'pidfd_open'):
+        return False
+    try:
+        pid = os.getpid()
+        os.close(os.pidfd_open(pid, 0))
+    except OSError:
+        # blocked by security policy like SECCOMP
+        return False
+    return True
 
 
 def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
