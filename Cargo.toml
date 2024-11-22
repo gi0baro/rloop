@@ -34,6 +34,7 @@ anyhow = "=1.0"
 dashmap = { version = "=6.1", features = ["inline"] }
 mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
 pyo3 = { version = "=0.22", features = ["anyhow", "extension-module", "generate-import-lib"] }
+socket2 = "=0.5"
 
 [target.'cfg(any(target_os = "freebsd", target_os = "windows"))'.dependencies]
 mimalloc = { version = "0.1.43", default-features = false, features = ["local_dynamic_tls"] }

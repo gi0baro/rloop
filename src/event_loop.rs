@@ -1,7 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
+    io::Write,
     mem,
+    os::fd::FromRawFd,
     sync::{atomic, Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -65,6 +67,7 @@ struct EventLoop {
     epoch: Instant,
     counter_ready: atomic::AtomicUsize,
     counter_io: atomic::AtomicU16,
+    ssock: Arc<RwLock<Option<socket2::Socket>>>,
     tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
     exc_handler: Arc<RwLock<PyObject>>,
@@ -259,6 +262,14 @@ impl EventLoop {
         Ok(false)
     }
 
+    #[inline]
+    fn wake(&self) {
+        let mut guard = self.ssock.write().unwrap();
+        if let Some(sock) = guard.as_mut() {
+            let _ = sock.write(b"\0");
+        }
+    }
+
     fn log_exception(&self, py: Python, ctx: Bound<PyDict>) -> PyResult<PyObject> {
         let handler = self.exc_handler.read().unwrap();
         handler.call1(py, (ctx, self.exception_handler.read().unwrap().clone_ref(py)))
@@ -277,6 +288,7 @@ impl EventLoop {
             epoch: Instant::now(),
             counter_ready: atomic::AtomicUsize::new(0),
             counter_io: atomic::AtomicU16::new(0),
+            ssock: Arc::new(RwLock::new(None)),
             tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
             exc_handler: Arc::new(RwLock::new(py.None())),
@@ -451,6 +463,15 @@ impl EventLoop {
         *guard = factory;
     }
 
+    fn _ssock_set(&self, fd: i32) {
+        let mut guard = self.ssock.write().unwrap();
+        *guard = Some(unsafe { socket2::Socket::from_raw_fd(fd) });
+    }
+
+    fn _ssock_del(&self) {
+        self.ssock.write().unwrap().take();
+    }
+
     fn _call_soon(&self, py: Python, callback: PyObject, args: PyObject, context: PyObject) -> PyResult<Py<CBHandle>> {
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
         let mut guard = self.handles_ready.lock().unwrap();
@@ -596,6 +617,10 @@ impl EventLoop {
             pyo3::ffi::PyErr_CheckSignals();
             pyo3::ffi::PyObject_CallNoArgs(noop_ptr);
         }
+    }
+
+    fn _wake(&self) {
+        self.wake();
     }
 
     fn _run(&self, py: Python) -> PyResult<()> {

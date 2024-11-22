@@ -43,6 +43,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook, finalizer=self._asyncgen_finalizer_hook)
 
         self._thread_id = threading.get_ident()
+        self._ssock_start()
         self._signals_resume()
         _set_running_loop(self)
 
@@ -51,6 +52,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def _run_forever_post(self, _old_agen_hooks):
         _set_running_loop(None)
         self._signals_pause()
+        self._ssock_stop()
         self._thread_id = 0
         self._stopping = False
         # self._set_coroutine_origin_tracking(False)
@@ -260,7 +262,9 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     #: threads methods
     def call_soon_threadsafe(self, callback, *args, context=None) -> CBHandle:
-        return self._call_soon(callback, args, context or self._base_ctx)
+        rv = self._call_soon(callback, args, context or self._base_ctx)
+        self._wake()
+        return rv
 
     def run_in_executor(self, executor, fn, *args):
         if _iscoroutine(fn) or _iscoroutinefunction(fn):
@@ -584,6 +588,49 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     #     raise NotImplementedError
 
     #: signals
+    def _ssock_start(self):
+        if self._ssock_w is not None:
+            raise RuntimeError('self-socket has been already setup')
+
+        self._ssock_r, self._ssock_w = socket.socketpair()
+        try:
+            self._ssock_r.setblocking(False)
+            self._ssock_w.setblocking(False)
+            self._ssock_set(self._ssock_w.fileno())
+        except Exception:
+            self._ssock_del()
+            self._ssock_r.close()
+            self._ssock_w = None
+            self._ssock_r = None
+            raise
+
+        self._reader_add(self._ssock_r.fileno(), self._ssock_reader, (), _copy_context())
+
+    def _ssock_stop(self):
+        if not self._ssock_w:
+            raise RuntimeError('self-socket has not been setup')
+
+        self._reader_rem(self._ssock_r.fileno())
+        self._ssock_del()
+        self._ssock_r.close()
+        self._ssock_w = None
+        self._ssock_r = None
+
+    def _ssock_reader(self):
+        sigdata = b''
+        while True:
+            try:
+                data = self._ssock_r.recv(65536)
+                if not data:
+                    break
+                sigdata += data
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                break
+        if sigdata and self._sig_listening:
+            self._signals_invoke(sigdata)
+
     def add_signal_handler(self, sig, callback, *args):
         if not self.__is_main_thread():
             raise ValueError('Signals can only be handled from the main thread')
@@ -625,24 +672,15 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         if not self.__is_main_thread():
             return
 
-        if self._sig_listening or (self._ssock_r is not None):
+        if self._sig_listening:
             raise RuntimeError('Signals handling has been already setup')
 
-        self._ssock_r, self._ssock_w = socket.socketpair()
         try:
-            self._ssock_r.setblocking(False)
-            self._ssock_w.setblocking(False)
-
             fd = self._ssock_w.fileno()
             self._sig_wfd = self.__set_sig_wfd(fd)
         except Exception:
-            self._ssock_w.close()
-            self._ssock_r.close()
-            self._ssock_w = None
-            self._ssock_r = None
             raise
 
-        self._reader_add(self._ssock_r.fileno(), self._ssock_reader, (), _copy_context())
         self._sig_listening = True
 
     def _signals_pause(self):
@@ -655,13 +693,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise RuntimeError('Signals handling has not been setup')
 
         self._sig_listening = False
-
         self.__set_sig_wfd(self._sig_wfd)
-        self._reader_rem(self._ssock_r.fileno())
-        self._ssock_w.close()
-        self._ssock_r.close()
-        self._ssock_w = None
-        self._ssock_r = None
 
     def _signals_clear(self):
         if not self.__is_main_thread():
@@ -693,21 +725,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def _signal_handle(self, signum):
         if not self._sig_handle(signum):
             self._sig_ceval(lambda: None)
-
-    def _ssock_reader(self):
-        sigdata = b''
-        while True:
-            try:
-                data = self._ssock_r.recv(65536)
-                if not data:
-                    break
-                sigdata += data
-            except InterruptedError:
-                continue
-            except BlockingIOError:
-                break
-        if sigdata:
-            self._signals_invoke(sigdata)
 
     #: task factory
     def set_task_factory(self, factory):
