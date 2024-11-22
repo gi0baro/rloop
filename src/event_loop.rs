@@ -90,7 +90,7 @@ struct EventLoop {
     #[pyo3(get)]
     _base_ctx: PyObject,
     #[pyo3(get)]
-    _signals: PyObject,
+    _signals: Py<PySet>,
 }
 
 impl EventLoop {
@@ -193,7 +193,7 @@ impl EventLoop {
             let handle = cb_handle.get();
             if !handle.cancelled.load(atomic::Ordering::Relaxed) {
                 if let Some((err, msg)) = handle.run(py) {
-                    let err_ctx = PyDict::new_bound(py);
+                    let err_ctx = PyDict::new(py);
                     err_ctx.set_item(pyo3::intern!(py, "exception"), err).unwrap();
                     err_ctx.set_item(pyo3::intern!(py, "message"), msg).unwrap();
                     err_ctx
@@ -309,7 +309,7 @@ impl EventLoop {
             watcher_child: Arc::new(RwLock::new(py.None())),
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
-            _signals: PySet::empty_bound(py)?.into_py(py),
+            _signals: PySet::empty(py)?.into_pyobject(py)?.unbind(),
         })
     }
 
@@ -602,7 +602,7 @@ impl EventLoop {
     }
 
     fn _sig_add(&self, py: Python, sig: u16, callback: PyObject, context: PyObject) -> Result<()> {
-        let args = PyTuple::empty_bound(py).into_py(py);
+        let args = PyTuple::empty(py).into_pyobject(py)?.into_any().unbind();
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
         self.sig_handlers.insert(sig, handle);
         Ok(())

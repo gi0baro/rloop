@@ -6,13 +6,13 @@ static WEAKREF: GILOnceCell<PyObject> = GILOnceCell::new();
 
 fn contextvars(py: Python) -> PyResult<&Bound<PyAny>> {
     Ok(CONTEXTVARS
-        .get_or_try_init(py, || py.import_bound("contextvars").map(Into::into))?
+        .get_or_try_init(py, || py.import("contextvars").map(Into::into))?
         .bind(py))
 }
 
 fn weakref(py: Python) -> PyResult<&Bound<PyAny>> {
     Ok(WEAKREF
-        .get_or_try_init(py, || py.import_bound("weakref").map(Into::into))?
+        .get_or_try_init(py, || py.import("weakref").map(Into::into))?
         .bind(py))
 }
 
