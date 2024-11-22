@@ -73,3 +73,7 @@ def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
 
     # "host" is not an IP address.
     return None
+
+
+def _noop():
+    return

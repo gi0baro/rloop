@@ -628,7 +628,7 @@ impl EventLoop {
         let noop_ptr = noop.as_ptr();
         unsafe {
             pyo3::ffi::PyErr_CheckSignals();
-            pyo3::ffi::PyObject_CallNoArgs(noop_ptr);
+            pyo3::ffi::compat::PyObject_CallNoArgs(noop_ptr);
         }
     }
 

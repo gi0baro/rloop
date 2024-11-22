@@ -25,7 +25,7 @@ from .subprocess import (
     _SubProcessTransport,
     _ThreadedChildWatcher,
 )
-from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info
+from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info, _noop
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
@@ -787,7 +787,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         self._sig_clear()
 
     def _signals_invoke(self, data):
-        self._sig_ceval(lambda: None)
+        self._sig_ceval(_noop)
         self._sig_loop_handled = True
 
         sigs = self._signals.copy()
@@ -803,7 +803,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     def _signal_handle(self, signum):
         if not self._sig_handle(signum):
-            self._sig_ceval(lambda: None)
+            self._sig_ceval(_noop)
 
     #: task factory
     def set_task_factory(self, factory):
