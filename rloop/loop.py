@@ -8,8 +8,9 @@ import threading
 import warnings
 from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
-from asyncio.futures import Future as _Future, isfuture as _isfuture
+from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_future as _wrap_future
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context as _copy_context
 from typing import Union
 
@@ -128,9 +129,8 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         self._executor_shutdown_called = True
         executor = self._default_executor
         if executor is not None:
-            # self._default_executor = None
-            # executor.shutdown(wait=False)
-            raise NotImplementedError
+            self._default_executor = None
+            executor.shutdown(wait=False)
 
     async def shutdown_asyncgens(self):
         self._asyncgens_shutdown_called = True
@@ -168,12 +168,33 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         self._asyncgens.add(agen)
 
-    # TODO
     async def shutdown_default_executor(self, timeout=None):
+        self._executor_shutdown_called = True
         if self._default_executor is None:
             return
 
-        raise NotImplementedError
+        future = self.create_future()
+        thread = threading.Thread(target=self._executor_shutdown, args=(future,))
+        thread.start()
+        try:
+            await future
+        finally:
+            thread.join(timeout)
+
+        if thread.is_alive():
+            warnings.warn(
+                f'The executor did not finish joining its threads within {timeout} seconds.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._default_executor.shutdown(wait=False)
+
+    def _executor_shutdown(self, future):
+        try:
+            self._default_executor.shutdown(wait=True)
+            self.call_soon_threadsafe(future.set_result, None)
+        except Exception as ex:
+            self.call_soon_threadsafe(future.set_exception, ex)
 
     #: callback scheduling methods
     # def _timer_handle_cancelled(self, handle):
@@ -241,13 +262,25 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def call_soon_threadsafe(self, callback, *args, context=None) -> CBHandle:
         return self._call_soon(callback, args, context or self._base_ctx)
 
-    # TODO
-    def run_in_executor(self, executor, func, *args):
-        raise NotImplementedError
+    def run_in_executor(self, executor, fn, *args):
+        if _iscoroutine(fn) or _iscoroutinefunction(fn):
+            raise TypeError('Coroutines cannot be used with executors')
 
-    # TODO
+        self._check_closed()
+
+        if executor is None:
+            executor = self._default_executor
+            if self._executor_shutdown_called:
+                raise RuntimeError('Executor shutdown has been called')
+
+            if executor is None:
+                executor = ThreadPoolExecutor()
+                self._default_executor = executor
+
+        return _wrap_future(executor.submit(fn, *args), loop=self)
+
     def set_default_executor(self, executor):
-        raise NotImplementedError
+        self._default_executor = executor
 
     #: network I/O methods
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):

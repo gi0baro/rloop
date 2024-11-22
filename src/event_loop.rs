@@ -69,6 +69,7 @@ struct EventLoop {
     closed: atomic::AtomicBool,
     exc_handler: Arc<RwLock<PyObject>>,
     exception_handler: Arc<RwLock<PyObject>>,
+    executor: Arc<RwLock<PyObject>>,
     sig_handlers: Arc<DashMap<u16, Py<CBHandle>>>,
     sig_listening: atomic::AtomicBool,
     sig_loop_handled: atomic::AtomicBool,
@@ -84,8 +85,6 @@ struct EventLoop {
     _asyncgens: PyObject,
     #[pyo3(get)]
     _base_ctx: PyObject,
-    #[pyo3(get)]
-    _default_executor: PyObject,
     #[pyo3(get)]
     _signals: PyObject,
 }
@@ -282,6 +281,7 @@ impl EventLoop {
             closed: atomic::AtomicBool::new(false),
             exc_handler: Arc::new(RwLock::new(py.None())),
             exception_handler: Arc::new(RwLock::new(py.None())),
+            executor: Arc::new(RwLock::new(py.None())),
             sig_handlers: Arc::new(DashMap::with_capacity(32)),
             sig_listening: atomic::AtomicBool::new(false),
             sig_loop_handled: atomic::AtomicBool::new(false),
@@ -295,7 +295,6 @@ impl EventLoop {
             thread_id: atomic::AtomicI64::new(0),
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
-            _default_executor: py.None(),
             _signals: PySet::empty_bound(py)?.into_py(py),
         })
     }
@@ -343,6 +342,17 @@ impl EventLoop {
     #[setter(_asyncgens_shutdown_called)]
     fn _set_asyncgens_shutdown_called(&self, val: bool) {
         self.shutdown_called_asyncgens.store(val, atomic::Ordering::Relaxed);
+    }
+
+    #[getter(_default_executor)]
+    fn _get_default_executor(&self, py: Python) -> PyObject {
+        self.executor.read().unwrap().clone_ref(py)
+    }
+
+    #[setter(_default_executor)]
+    fn _set_default_executor(&self, val: PyObject) {
+        let mut guard = self.executor.write().unwrap();
+        *guard = val;
     }
 
     #[getter(_exc_handler)]
