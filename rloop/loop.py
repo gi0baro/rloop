@@ -210,7 +210,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         return self._call_later(delay, callback, args, context or _copy_context())
 
     def call_at(self, when, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        delay = when - self.time()
+        delay = round((when - self.time()) * 1_000_000)
         if delay <= 0:
             return self._call_soon(callback, args, context or _copy_context())
         return self._call_later(delay, callback, args, context or _copy_context())
