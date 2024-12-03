@@ -75,5 +75,5 @@ def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
     return None
 
 
-def _noop():
+def _noop(*args, **kwargs):
     return

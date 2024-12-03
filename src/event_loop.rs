@@ -11,10 +11,7 @@ use std::{
 use anyhow::Result;
 use dashmap::DashMap;
 use mio::{Events, Interest, Poll, Token};
-use pyo3::{
-    prelude::*,
-    types::{PyDict, PySet, PyTuple},
-};
+use pyo3::{prelude::*, types::PyDict};
 
 use crate::handles::{CBHandle, TimerHandle};
 use crate::io::Source;
@@ -89,8 +86,6 @@ struct EventLoop {
     _asyncgens: PyObject,
     #[pyo3(get)]
     _base_ctx: PyObject,
-    #[pyo3(get)]
-    _signals: Py<PySet>,
 }
 
 impl EventLoop {
@@ -309,7 +304,6 @@ impl EventLoop {
             watcher_child: Arc::new(RwLock::new(py.None())),
             _asyncgens: weakset(py)?.unbind(),
             _base_ctx: copy_context(py)?.unbind(),
-            _signals: PySet::empty(py)?.into_pyobject(py)?.unbind(),
         })
     }
 
@@ -601,8 +595,7 @@ impl EventLoop {
         self.writer_rem(token)
     }
 
-    fn _sig_add(&self, py: Python, sig: u16, callback: PyObject, context: PyObject) -> Result<()> {
-        let args = PyTuple::empty(py).into_pyobject(py)?.into_any().unbind();
+    fn _sig_add(&self, py: Python, sig: u16, callback: PyObject, args: PyObject, context: PyObject) -> Result<()> {
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
         self.sig_handlers.insert(sig, handle);
         Ok(())
@@ -616,20 +609,16 @@ impl EventLoop {
         self.sig_handlers.clear();
     }
 
-    fn _sig_handle(&self, py: Python, sig: u16) -> bool {
-        if let Some(handle) = self.sig_handlers.get(&sig) {
-            handle.get().run(py);
-            return true;
+    fn _sig_handle(&self, py: Python, sig: u16) -> (bool, bool) {
+        if let Some(pyhandle) = self.sig_handlers.get(&sig) {
+            let cancelled = pyhandle.get().cancelled.load(atomic::Ordering::Relaxed);
+            let mut guard = self.handles_ready.lock().unwrap();
+            guard.push_back(pyhandle.clone_ref(py));
+            self.counter_ready.fetch_add(1, atomic::Ordering::Relaxed);
+            drop(guard);
+            return (true, cancelled);
         }
-        false
-    }
-
-    fn _sig_ceval(&self, noop: PyObject) {
-        let noop_ptr = noop.as_ptr();
-        unsafe {
-            pyo3::ffi::PyErr_CheckSignals();
-            pyo3::ffi::compat::PyObject_CallNoArgs(noop_ptr);
-        }
+        (false, false)
     }
 
     fn _wake(&self) {

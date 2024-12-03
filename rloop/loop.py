@@ -696,19 +696,23 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         self._ssock_r = None
 
     def _ssock_reader(self):
-        sigdata = b''
         while True:
             try:
-                data = self._ssock_r.recv(65536)
+                data = self._ssock_r.recv(4096)
                 if not data:
                     break
-                sigdata += data
+                if not self._sig_listening:
+                    continue
+                # ignore null bytes written by self wake
+                signums = list(filter(None, data))
+                if signums:
+                    self._sig_loop_handled = True
+                for signum in signums:
+                    self._signal_handle(signum)
             except InterruptedError:
                 continue
             except BlockingIOError:
                 break
-        if sigdata and self._sig_listening:
-            self._signals_invoke(sigdata)
 
     def add_signal_handler(self, sig, callback, *args):
         if not self.__is_main_thread():
@@ -718,10 +722,11 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise TypeError('Coroutines cannot be used as signals handlers')
 
         self._check_closed()
-        self._sig_add(sig, callback, _copy_context())
+        self._check_signal(sig)
+        self._sig_add(sig, callback, args, _copy_context())
         try:
             # register a dummy signal handler so Python will write the signal no in the wakeup fd
-            signal.signal(sig, self.__sighandler)
+            signal.signal(sig, _noop)
             # set SA_RESTART to limit EINTR occurrences
             signal.siginterrupt(sig, False)
         except OSError as exc:
@@ -734,13 +739,32 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         if not self._is_main_thread():
             raise ValueError('Signals can only be handled from the main thread')
 
-        return self._sig_rem(sig)
+        if not self._sig_rem(sig):
+            return False
+
+        if sig == signal.SIGINT:
+            handler = signal.default_int_handler
+        else:
+            handler = signal.SIG_DFL
+
+        try:
+            signal.signal(sig, handler)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f'signum {sig} cannot be caught')
+            raise
+
+        return True
 
     def __is_main_thread(self):
         return threading.main_thread().ident == threading.current_thread().ident
 
-    def __sighandler(self, signum, frame):
-        self._signals.add(signum)
+    def _check_signal(self, sig):
+        if not isinstance(sig, int):
+            raise TypeError(f'sig must be an int, not {sig!r}')
+
+        if sig not in signal.valid_signals():
+            raise ValueError(f'invalid signal number {sig}')
 
     def __set_sig_wfd(self, fd):
         if fd >= 0:
@@ -786,24 +810,11 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         self._sig_clear()
 
-    def _signals_invoke(self, data):
-        self._sig_ceval(_noop)
-        self._sig_loop_handled = True
-
-        sigs = self._signals.copy()
-        self._signals.clear()
-        for signum in data:
-            if not signum:
-                continue
-            sigs.discard(signum)
-            self._signal_handle(signum)
-
-        for signum in sigs:
-            self._signal_handle(signum)
-
     def _signal_handle(self, signum):
-        if not self._sig_handle(signum):
-            self._sig_ceval(_noop)
+        self._sig_loop_handled = True
+        handled, cancelled = self._sig_handle(signum)
+        if handled and cancelled:
+            self.remove_signal_handler(signum)
 
     #: task factory
     def set_task_factory(self, factory):
