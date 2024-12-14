@@ -41,6 +41,8 @@ lint-rust:
 		-A clippy::too-many-lines \
 		-A clippy::type-complexity \
 		-A clippy::unused-self \
+		-A clippy::used-underscore-binding \
+		-A clippy::used-underscore-items \
 		-A clippy::wrong-self-convention
 
 .PHONY: lint

@@ -210,19 +210,16 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     # def _timer_handle_cancelled(self, handle):
     #     raise NotImplementedError
 
-    def call_soon(self, callback, *args, context=None) -> CBHandle:
-        return self._call_soon(callback, args, context or _copy_context())
-
     def call_later(self, delay, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
         if delay <= 0:
-            return self._call_soon(callback, args, context or _copy_context())
+            return self.call_soon(callback, *args, context=context or _copy_context())
         delay = round(delay * 1_000_000)
         return self._call_later(delay, callback, args, context or _copy_context())
 
     def call_at(self, when, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
         delay = round((when - self.time()) * 1_000_000)
         if delay <= 0:
-            return self._call_soon(callback, args, context or _copy_context())
+            return self.call_soon(callback, *args, context=context or _copy_context())
         return self._call_later(delay, callback, args, context or _copy_context())
 
     def time(self) -> float:
@@ -269,11 +266,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             return task
 
     #: threads methods
-    def call_soon_threadsafe(self, callback, *args, context=None) -> CBHandle:
-        rv = self._call_soon(callback, args, context or self._base_ctx)
-        self._wake()
-        return rv
-
     def run_in_executor(self, executor, fn, *args):
         if _iscoroutine(fn) or _iscoroutinefunction(fn):
             raise TypeError('Coroutines cannot be used with executors')
@@ -675,44 +667,20 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         try:
             self._ssock_r.setblocking(False)
             self._ssock_w.setblocking(False)
-            self._ssock_set(self._ssock_w.fileno())
+            self._ssock_set(self._ssock_r.fileno(), self._ssock_w.fileno())
         except Exception:
-            self._ssock_del()
-            self._ssock_r.close()
+            self._ssock_del(self._ssock_r.fileno())
             self._ssock_w = None
             self._ssock_r = None
             raise
-
-        self._reader_add(self._ssock_r.fileno(), self._ssock_reader, (), _copy_context())
 
     def _ssock_stop(self):
         if not self._ssock_w:
             raise RuntimeError('self-socket has not been setup')
 
-        self._reader_rem(self._ssock_r.fileno())
-        self._ssock_del()
-        self._ssock_r.close()
+        self._ssock_del(self._ssock_r.fileno())
         self._ssock_w = None
         self._ssock_r = None
-
-    def _ssock_reader(self):
-        while True:
-            try:
-                data = self._ssock_r.recv(4096)
-                if not data:
-                    break
-                if not self._sig_listening:
-                    continue
-                # ignore null bytes written by self wake
-                signums = list(filter(None, data))
-                if signums:
-                    self._sig_loop_handled = True
-                for signum in signums:
-                    self._signal_handle(signum)
-            except InterruptedError:
-                continue
-            except BlockingIOError:
-                break
 
     def add_signal_handler(self, sig, callback, *args):
         if not self.__is_main_thread():
@@ -809,12 +777,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise RuntimeError('Signals handling was not cleaned up')
 
         self._sig_clear()
-
-    def _signal_handle(self, signum):
-        self._sig_loop_handled = True
-        handled, cancelled = self._sig_handle(signum)
-        if handled and cancelled:
-            self.remove_signal_handler(signum)
 
     #: task factory
     def set_task_factory(self, factory):
