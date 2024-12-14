@@ -21,6 +21,10 @@ pub(crate) enum Source {
     FD(RawSocket),
 }
 
+pub(crate) enum InternalIO {
+    Signals,
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct SourceRawSocket<'a>(pub &'a RawSocket);

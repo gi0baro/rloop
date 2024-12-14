@@ -3,8 +3,9 @@ use std::sync::atomic;
 
 // pub(crate) enum Handle {
 //     Callback(Py<CBHandle>),
+//     Signal,
 //     // Timer(Py<TimerHandle>),
-//     IO(Arc<CBHandle>),
+//     // IO(Arc<CBHandle>),
 // }
 
 #[pyclass(frozen)]
