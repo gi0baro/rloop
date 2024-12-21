@@ -1,0 +1,124 @@
+name: build
+
+on: workflow_dispatch
+
+env:
+  PY_ALL: 3.9 3.10 3.11 3.12 3.13 3.13t pypy3.9 pypy3.10
+
+jobs:
+  wheels:
+    name: wheel ${{ matrix.platform || matrix.os }}(${{ matrix.target }}) - ${{ matrix.manylinux || 'auto' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos]
+        target: [x86_64, aarch64]
+        manylinux: [auto]
+        include:
+          - os: ubuntu
+            platform: linux
+          - os: ubuntu
+            platform: linux
+            target: x86_64
+            manylinux: auto
+            interpreter: pypy3.9 pypy3.10
+          - os: macos
+            target: x86_64
+            interpreter: pypy3.9 pypy3.10
+          - os: macos
+            target: aarch64
+            interpreter: pypy3.9 pypy3.10
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+            container: messense/manylinux_2_24-cross:aarch64
+          - os: ubuntu
+            platform: linux
+            target: x86_64
+            manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+            manylinux: musllinux_1_1
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pyo3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          args: --release --out dist --interpreter ${{ matrix.interpreter || env.PY_ALL }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          container: ${{ matrix.container }}
+          docker-options: -e CI
+      - name: Upload wheels
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: dist
+
+  wheels-pgo:
+    name: pgo-wheel ${{ matrix.platform || matrix.os }} (${{ matrix.interpreter}})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14]
+        manylinux: [auto]
+        interpreter: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.13t"]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.interpreter }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - name: prepare profiling directory
+        shell: bash
+        run: mkdir -p ${{ github.workspace }}/profdata
+      - name: Build initial wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          args: --release --out pgo_wheel --interpreter ${{ matrix.interpreter }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          docker-options: -e CI
+        env:
+          RUSTFLAGS: "-Cprofile-generate=${{ github.workspace }}/profdata"
+      - run: |
+          RUST_HOST=$(rustc -Vv | grep host | cut -d ' ' -f 2) rustup run stable bash -c 'echo LLVM_PROFDATA=$RUSTUP_HOME/toolchains/$RUSTUP_TOOLCHAIN/lib/rustlib/$RUST_HOST/bin/llvm-profdata >> "$GITHUB_ENV"'
+        shell: bash
+      - name: Generate PGO data
+        shell: bash
+        run: |
+          uv python install ${{ env.UV_PYTHON }}
+          uv venv .venv
+          uv pip install pytest pytest-asyncio
+          uv pip install rloop --no-index --no-deps --find-links pgo_wheel --force-reinstall
+          LLVM_PROFILE_FILE=${{ github.workspace }}/profdata/rlp_%m_%p.profraw uv run --no-sync pytest tests
+      - name: merge PGO data
+        run: ${{ env.LLVM_PROFDATA }} merge --failure-mode=all -o ${{ github.workspace }}/merged.profdata ${{ github.workspace }}/profdata
+      - name: Build PGO wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist --interpreter ${{ matrix.interpreter }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          rust-toolchain: stable
+          docker-options: -e CI
+        env:
+          RUSTFLAGS: "-Cprofile-use=${{ github.workspace }}/merged.profdata"
+      - name: Upload wheels
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: dist
