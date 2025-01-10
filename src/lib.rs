@@ -4,7 +4,11 @@ use std::sync::OnceLock;
 mod event_loop;
 mod handles;
 mod io;
+mod log;
 mod py;
+mod server;
+mod tcp;
+mod time;
 
 pub fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
@@ -21,5 +25,7 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
 
     event_loop::init_pymodule(module)?;
     handles::init_pymodule(module)?;
+    server::init_pymodule(module)?;
+
     Ok(())
 }

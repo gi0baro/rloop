@@ -1,12 +1,7 @@
 use pyo3::prelude::*;
 use std::sync::atomic;
 
-// pub(crate) enum Handle {
-//     Callback(Py<CBHandle>),
-//     Signal,
-//     // Timer(Py<TimerHandle>),
-//     // IO(Arc<CBHandle>),
-// }
+use crate::py::run_in_ctx;
 
 #[pyclass(frozen)]
 pub(crate) struct CBHandle {
@@ -31,14 +26,7 @@ impl CBHandle {
         let cb = self.callback.as_ptr();
         let args = self.args.as_ptr();
 
-        let res: PyResult<Bound<PyAny>> = unsafe {
-            pyo3::ffi::PyContext_Enter(ctx);
-            let ptr = pyo3::ffi::PyObject_CallObject(cb, args);
-            pyo3::ffi::PyContext_Exit(ctx);
-            Bound::from_owned_ptr_or_err(py, ptr)
-        };
-
-        if let Err(err) = res {
+        if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
             // TODO: better format for callback repr
             let msg = format!("Exception in callback {:?}", self.callback);
             return Some((err, msg));

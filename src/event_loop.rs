@@ -1,77 +1,56 @@
 use std::{
-    cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
     io::{Read, Write},
     mem,
-    os::fd::FromRawFd,
+    os::fd::{AsRawFd, FromRawFd},
     sync::{atomic, Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use dashmap::DashMap;
-use mio::{Events, Interest, Poll, Token};
-use pyo3::{prelude::*, types::PyDict};
+use mio::{event, Interest, Poll, Token};
+use pyo3::prelude::*;
 
-use crate::handles::{CBHandle, TimerHandle};
-use crate::io::{InternalIO, Source};
-use crate::py::{copy_context, weakset};
+use crate::{
+    handles::{CBHandle, TimerHandle},
+    io::Source,
+    log::{log_exc_to_py_ctx, LogExc},
+    py::{copy_context, weakset},
+    server::Server,
+    tcp::{TCPServer, TCPServerRef, TCPTransport},
+    time::Timer,
+};
 
-struct Timer {
-    pub handle: Py<CBHandle>,
-    when: u128,
+enum Handle {
+    Internal(Source),
+    Py(PyHandleData),
+    TCPListener(TCPListenerHandleData),
+    TCPStream(TCPStreamHandleData),
 }
 
-impl PartialEq for Timer {
-    fn eq(&self, _other: &Self) -> bool {
-        false
-    }
-}
-
-impl Eq for Timer {}
-
-impl PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Timer {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.when < other.when {
-            return Ordering::Greater;
-        }
-        if self.when > other.when {
-            return Ordering::Less;
-        }
-        Ordering::Equal
-    }
-}
-
-enum IOHandle {
-    Internal(IOHandleData),
-    Py(PyIOHandleData),
-}
-
-struct IOHandleData {
-    source: Source,
-    #[allow(dead_code)]
-    interest: Interest,
-    handle: InternalIO,
-}
-
-struct PyIOHandleData {
+struct PyHandleData {
     source: Source,
     interest: Interest,
     cbr: Option<Py<CBHandle>>,
     cbw: Option<Py<CBHandle>>,
 }
 
+struct TCPListenerHandleData {
+    source: Source,
+    server: TCPServerRef,
+}
+
+struct TCPStreamHandleData {
+    source: Source,
+    transport: Py<TCPTransport>,
+}
+
 #[pyclass(frozen, subclass)]
-struct EventLoop {
+pub(crate) struct EventLoop {
     idle: atomic::AtomicBool,
     io: Arc<Mutex<Poll>>,
-    handles_io: Arc<DashMap<Token, IOHandle>>,
+    handles_io: Arc<DashMap<Token, Handle>>,
     handles_ready: Arc<Mutex<VecDeque<Py<CBHandle>>>>,
     handles_sched: Arc<Mutex<BinaryHeap<Timer>>>,
     epoch: Instant,
@@ -104,7 +83,7 @@ struct EventLoop {
 impl EventLoop {
     #[inline]
     fn step(&self, py: Python) -> std::result::Result<(), std::io::Error> {
-        let mut io_events = Events::with_capacity(128);
+        let mut io_events = event::Events::with_capacity(128);
         let mut sched_time: Option<u64> = None;
         let mut skip_poll = false;
 
@@ -162,19 +141,10 @@ impl EventLoop {
             // NOTE: cancellation is not necessary as we have custom futures
             if let Some(io_handle) = self.handles_io.get(&event.token()) {
                 match io_handle.value() {
-                    IOHandle::Py(handle) => {
-                        if let Some(cbr) = &handle.cbr {
-                            if event.is_readable() {
-                                cb_handles.push_back(cbr.clone_ref(py));
-                            }
-                        }
-                        if let Some(cbw) = &handle.cbw {
-                            if event.is_writable() {
-                                cb_handles.push_back(cbw.clone_ref(py));
-                            }
-                        }
-                    }
-                    IOHandle::Internal(handle) => self.handle_internal_io(handle, py, &mut cb_handles),
+                    Handle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
+                    Handle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &mut cb_handles),
+                    Handle::TCPStream(handle) => self.handle_io_tcps(py, event, handle, &mut cb_handles),
+                    Handle::Internal(_) => self.handle_io_internal(py, &mut cb_handles),
                 }
             }
         }
@@ -204,12 +174,7 @@ impl EventLoop {
             let handle = cb_handle.get();
             if !handle.cancelled.load(atomic::Ordering::Relaxed) {
                 if let Some((err, msg)) = handle.run(py) {
-                    let err_ctx = PyDict::new(py);
-                    err_ctx.set_item(pyo3::intern!(py, "exception"), err).unwrap();
-                    err_ctx.set_item(pyo3::intern!(py, "message"), msg).unwrap();
-                    err_ctx
-                        .set_item(pyo3::intern!(py, "handle"), cb_handle.clone_ref(py))
-                        .unwrap();
+                    let err_ctx = LogExc::cb_handle(err, msg, cb_handle.clone_ref(py).into_any());
                     let _ = self.log_exception(py, err_ctx);
                 }
             }
@@ -219,14 +184,67 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_internal_io(&self, handle_data: &IOHandleData, py: Python, handles_ready: &mut VecDeque<Py<CBHandle>>) {
-        match handle_data.handle {
-            InternalIO::Signals => {
-                let sigs = py.allow_threads(|| self.read_from_self());
-                for sig in sigs {
-                    self.sig_handle(py, sig, handles_ready);
-                }
+    fn handle_io_py(
+        &self,
+        py: Python,
+        event: &event::Event,
+        handle: &PyHandleData,
+        handles: &mut VecDeque<Py<CBHandle>>,
+    ) {
+        if let Some(cbr) = &handle.cbr {
+            if event.is_readable() {
+                handles.push_back(cbr.clone_ref(py));
             }
+        }
+        if let Some(cbw) = &handle.cbw {
+            if event.is_writable() {
+                handles.push_back(cbw.clone_ref(py));
+            }
+        }
+    }
+
+    fn handle_io_tcpl(&self, py: Python, handle: &TCPListenerHandleData, handles: &mut VecDeque<Py<CBHandle>>) {
+        py.allow_threads(|| loop {
+            match handle.server.listener.accept() {
+                Ok((stream, _)) => {
+                    Python::with_gil(|pyi| {
+                        let transport = handle.server.transport(pyi, stream);
+                        let (cb, args) = transport.attach(pyi);
+                        let _ = self.schedule_cbhandle(handles, pyi, cb, args, copy_context(pyi).unwrap().unbind());
+                        self.tcp_stream_add(pyi, Py::new(pyi, transport).unwrap());
+                    });
+                }
+                // Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Err(_) => {}
+                Err(_) => break,
+            }
+        });
+    }
+
+    fn handle_io_tcps(
+        &self,
+        py: Python,
+        event: &event::Event,
+        handle: &TCPStreamHandleData,
+        handles: &mut VecDeque<Py<CBHandle>>,
+    ) {
+        let transport = handle.transport.get();
+
+        if event.is_readable() {
+            let (cb, args) = transport.recv(py);
+            let pyctx = copy_context(py).unwrap().unbind();
+            handles.push_back(Py::new(py, CBHandle::new(cb, args, pyctx)).unwrap());
+        } else if event.is_writable() {
+        } else if event.is_read_closed() {
+        } else if event.is_write_closed() {
+        }
+    }
+
+    #[inline]
+    fn handle_io_internal(&self, py: Python, handles_ready: &mut VecDeque<Py<CBHandle>>) {
+        let sigs = py.allow_threads(|| self.read_from_self());
+        for sig in sigs {
+            self.sig_handle(py, sig, handles_ready);
         }
     }
 
@@ -241,6 +259,19 @@ impl EventLoop {
                 handles_ready.push_back(pyhandle.clone_ref(py));
             }
         }
+    }
+
+    pub(crate) fn schedule_cbhandle(
+        &self,
+        handles: &mut VecDeque<Py<CBHandle>>,
+        py: Python,
+        callback: PyObject,
+        args: PyObject,
+        context: PyObject,
+    ) -> Result<()> {
+        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
+        handles.push_back(handle);
+        Ok(())
     }
 
     #[inline(always)]
@@ -282,7 +313,7 @@ impl EventLoop {
 
     #[inline]
     fn reader_rem(&self, token: Token) -> Result<bool> {
-        if let Some((_, IOHandle::Py(mut item))) = self.handles_io.remove(&token) {
+        if let Some((_, Handle::Py(mut item))) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
             match item.interest {
                 Interest::READABLE => {
@@ -294,7 +325,7 @@ impl EventLoop {
                     guard_poll.registry().reregister(&mut item.source, token, interest)?;
                     self.handles_io.insert(
                         token,
-                        IOHandle::Py(PyIOHandleData {
+                        Handle::Py(PyHandleData {
                             source: item.source,
                             interest,
                             cbr: None,
@@ -310,7 +341,7 @@ impl EventLoop {
 
     #[inline]
     fn writer_rem(&self, token: Token) -> Result<bool> {
-        if let Some((_, IOHandle::Py(mut item))) = self.handles_io.remove(&token) {
+        if let Some((_, Handle::Py(mut item))) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
             match item.interest {
                 Interest::WRITABLE => {
@@ -322,7 +353,7 @@ impl EventLoop {
                     guard_poll.registry().reregister(&mut item.source, token, interest)?;
                     self.handles_io.insert(
                         token,
-                        IOHandle::Py(PyIOHandleData {
+                        Handle::Py(PyHandleData {
                             source: item.source,
                             interest,
                             cbr: item.cbr,
@@ -336,9 +367,102 @@ impl EventLoop {
         Ok(false)
     }
 
-    fn log_exception(&self, py: Python, ctx: Bound<PyDict>) -> PyResult<PyObject> {
+    pub(crate) fn tcp_listener_add(&self, server: TCPServerRef) {
+        let token = Token(server.listener.as_raw_fd() as usize);
+        let mut source = Source::TCPListener(server.listener.clone());
+
+        let guard_poll = self.io.lock().unwrap();
+        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
+        self.handles_io
+            .insert(token, Handle::TCPListener(TCPListenerHandleData { source, server }));
+    }
+
+    pub(crate) fn tcp_listener_rem(&self, fd: usize) -> Result<bool> {
+        let token = Token(fd);
+        if let Some((_, handle)) = self.handles_io.remove(&token) {
+            match handle {
+                Handle::TCPListener(mut item) => {
+                    let guard_poll = self.io.lock().unwrap();
+                    guard_poll.registry().deregister(&mut item.source)?;
+                    return Ok(true);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(false)
+    }
+
+    fn tcp_stream_add(&self, py: Python, transport: Py<TCPTransport>) {
+        let rtransport = transport.get();
+        let token = Token(rtransport.fd);
+        let mut source = Source::TCPStream(rtransport.stream.clone());
+
+        let guard_poll = self.io.lock().unwrap();
+        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
+        drop(guard_poll);
+
+        self.handles_io.insert(
+            token,
+            Handle::TCPStream(TCPStreamHandleData {
+                source,
+                transport: transport.clone_ref(py),
+            }),
+        );
+    }
+
+    fn tcp_stream_upd(&self, fd: usize, read: bool, write: bool) -> Result<()> {
+        let token = Token(fd);
+        if let Some((_, Handle::TCPStream(mut item))) = self.handles_io.remove(&token) {
+            let guard_poll = self.io.lock().unwrap();
+            match (read, write) {
+                (true, true) => {
+                    guard_poll.registry().reregister(
+                        &mut item.source,
+                        token,
+                        Interest::READABLE | Interest::WRITABLE,
+                    )?;
+                }
+                (true, false) => {
+                    guard_poll
+                        .registry()
+                        .reregister(&mut item.source, token, Interest::READABLE)?;
+                }
+                (false, true) => {
+                    guard_poll
+                        .registry()
+                        .reregister(&mut item.source, token, Interest::WRITABLE)?;
+                }
+                (false, false) => {
+                    guard_poll.registry().deregister(&mut item.source)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn tcp_stream_rem(&self, fd: usize) -> Result<()> {
+        let token = Token(fd);
+        if let Some((_, handle)) = self.handles_io.remove(&token) {
+            match handle {
+                Handle::TCPStream(mut item) => {
+                    let guard_poll = self.io.lock().unwrap();
+                    guard_poll.registry().deregister(&mut item.source)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {
         let handler = self.exc_handler.read().unwrap();
-        handler.call1(py, (ctx, self.exception_handler.read().unwrap().clone_ref(py)))
+        handler.call1(
+            py,
+            (
+                log_exc_to_py_ctx(py, ctx),
+                self.exception_handler.read().unwrap().clone_ref(py),
+            ),
+        )
     }
 }
 
@@ -548,23 +672,16 @@ impl EventLoop {
         let guard_poll = self.io.lock().unwrap();
         guard_poll.registry().register(&mut source, token, interest)?;
         drop(guard_poll);
-        self.handles_io.insert(
-            token,
-            IOHandle::Internal(IOHandleData {
-                source,
-                interest,
-                handle: InternalIO::Signals,
-            }),
-        );
+        self.handles_io.insert(token, Handle::Internal(source));
 
         Ok(())
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
         let token = Token(fd_r);
-        if let Some((_, IOHandle::Internal(mut item))) = self.handles_io.remove(&token) {
+        if let Some((_, Handle::Internal(mut source))) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
-            guard_poll.registry().deregister(&mut item.source)?;
+            guard_poll.registry().deregister(&mut source)?;
         }
         self.ssock.write().unwrap().take();
         Ok(())
@@ -640,7 +757,7 @@ impl EventLoop {
         let token = Token(fd);
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
         if let Some(mut item) = self.handles_io.get_mut(&token) {
-            if let IOHandle::Py(data) = item.value_mut() {
+            if let Handle::Py(data) = item.value_mut() {
                 let interest = data.interest | Interest::READABLE;
                 let guard_poll = self.io.lock().unwrap();
                 guard_poll.registry().reregister(&mut data.source, token, interest)?;
@@ -658,7 +775,7 @@ impl EventLoop {
         drop(guard_poll);
         self.handles_io.insert(
             token,
-            IOHandle::Py(PyIOHandleData {
+            Handle::Py(PyHandleData {
                 source,
                 interest,
                 cbr: Some(handle.clone_ref(py)),
@@ -687,7 +804,7 @@ impl EventLoop {
         let handle = Py::new(py, CBHandle::new(callback, args, context))?;
 
         if let Some(mut item) = self.handles_io.get_mut(&token) {
-            if let IOHandle::Py(data) = item.value_mut() {
+            if let Handle::Py(data) = item.value_mut() {
                 let interest = data.interest | Interest::WRITABLE;
                 let guard_poll = self.io.lock().unwrap();
                 guard_poll.registry().reregister(&mut data.source, token, interest)?;
@@ -705,7 +822,7 @@ impl EventLoop {
         drop(guard_poll);
         self.handles_io.insert(
             token,
-            IOHandle::Py(PyIOHandleData {
+            Handle::Py(PyHandleData {
                 source,
                 interest,
                 cbr: None,
@@ -720,6 +837,21 @@ impl EventLoop {
     fn _writer_rem(&self, fd: usize) -> Result<bool> {
         let token = Token(fd);
         self.writer_rem(token)
+    }
+
+    fn _tcp_server(
+        pyself: Py<Self>,
+        py: Python,
+        fds: Vec<i32>,
+        protocol_factory: PyObject,
+        backlog: i32,
+    ) -> PyResult<Py<Server>> {
+        let mut servers = Vec::new();
+        for fd in fds {
+            servers.push(TCPServer::from_fd(fd, backlog, protocol_factory.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), servers);
+        Py::new(py, server)
     }
 
     fn _sig_add(&self, py: Python, sig: u8, callback: PyObject, args: PyObject, context: PyObject) -> Result<()> {
