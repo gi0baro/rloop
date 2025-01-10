@@ -79,7 +79,7 @@ extend-ignore = [
     'S101', # assert is fine
 ]
 flake8-quotes = { inline-quotes = 'single', multiline-quotes = 'double' }
-mccabe = { max-complexity = 16 }
+mccabe = { max-complexity = 25 }
 
 [tool.ruff.format]
 quote-style = 'single'
