@@ -2,13 +2,11 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 
 use anyhow::Result;
-use mio::net::{TcpListener, TcpStream};
-use pyo3::{
-    buffer::PyBuffer,
-    prelude::*,
-    types::{PyBytes, PyTuple},
-    IntoPyObjectExt,
+use mio::{
+    net::{TcpListener, TcpStream},
+    Interest,
 };
+use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -18,20 +16,24 @@ use std::{
 
 use crate::{
     event_loop::EventLoop,
+    handles::CBHandle,
     log::LogExc,
     py::{asyncio_proto_buf, copy_context, run_in_ctx0},
+    sock::SocketWrapper,
 };
 
 pub(crate) struct TCPServer {
-    fd: i32,
+    pub fd: i32,
+    sfamily: i32,
     backlog: i32,
     protocol_factory: PyObject,
 }
 
 impl TCPServer {
-    pub(crate) fn from_fd(fd: i32, backlog: i32, protocol_factory: PyObject) -> Self {
+    pub(crate) fn from_fd(fd: i32, sfamily: i32, backlog: i32, protocol_factory: PyObject) -> Self {
         Self {
             fd,
+            sfamily,
             backlog,
             protocol_factory,
         }
@@ -47,6 +49,7 @@ impl TCPServer {
         let sref = TCPServerRef {
             pyloop: pyloop.clone_ref(py),
             listener: listener.into(),
+            sfamily: self.sfamily,
             proto_factory: self.protocol_factory.clone_ref(py),
         };
         pyloop.get().tcp_listener_add(sref);
@@ -61,16 +64,22 @@ impl TCPServer {
     }
 }
 
-// #[pyclass(frozen)]
 pub(crate) struct TCPServerRef {
     pyloop: Py<EventLoop>,
     pub listener: Arc<TcpListener>,
+    sfamily: i32,
     proto_factory: PyObject,
 }
 
 impl TCPServerRef {
     pub(crate) fn transport(&self, py: Python, stream: TcpStream) -> TCPTransport {
-        TCPTransport::new(py, stream, self.pyloop.clone_ref(py), self.proto_factory.clone_ref(py))
+        TCPTransport::new(
+            py,
+            stream,
+            self.sfamily,
+            self.pyloop.clone_ref(py),
+            self.proto_factory.clone_ref(py),
+        )
     }
 }
 
@@ -78,17 +87,20 @@ impl TCPServerRef {
 pub(crate) struct TCPTransport {
     pub stream: Arc<Mutex<TcpStream>>,
     pub fd: usize,
+    sock: Py<SocketWrapper>,
     pyloop: Py<EventLoop>,
     proto: PyObject,
     extra: HashMap<String, PyObject>,
     buffered_proto: bool,
     closing: atomic::AtomicBool,
-    reading: atomic::AtomicBool,
+    paused: atomic::AtomicBool,
     paused_proto: atomic::AtomicBool,
     buffer: VecDeque<Vec<u8>>,
     water_hi: atomic::AtomicUsize,
     water_lo: atomic::AtomicUsize,
+    weof: atomic::AtomicBool,
     pym_conn_made: PyObject,
+    pym_conn_lost: PyObject,
     pym_recv_data: PyObject,
     pym_recv_eof: PyObject,
     pym_buf_get: PyObject,
@@ -97,7 +109,13 @@ pub(crate) struct TCPTransport {
 }
 
 impl TCPTransport {
-    pub(crate) fn new(py: Python, stream: TcpStream, pyloop: Py<EventLoop>, proto_factory: PyObject) -> Self {
+    pub(crate) fn new(
+        py: Python,
+        stream: TcpStream,
+        sfamily: i32,
+        pyloop: Py<EventLoop>,
+        proto_factory: PyObject,
+    ) -> Self {
         let fd = stream.as_raw_fd() as usize;
         let proto = proto_factory.bind(py).call0().unwrap();
         let mut buffered_proto = false;
@@ -113,6 +131,7 @@ impl TCPTransport {
             pym_buf_get = py.None();
         }
         let pym_conn_made = proto.getattr(pyo3::intern!(py, "connection_made")).unwrap().unbind();
+        let pym_conn_lost = proto.getattr(pyo3::intern!(py, "connection_lost")).unwrap().unbind();
         let pym_recv_eof = proto.getattr(pyo3::intern!(py, "eof_received")).unwrap().unbind();
         let pym_write_pause = proto.getattr(pyo3::intern!(py, "pause_writing")).unwrap().unbind();
         let pym_write_resume = proto.getattr(pyo3::intern!(py, "resume_writing")).unwrap().unbind();
@@ -123,17 +142,20 @@ impl TCPTransport {
         Self {
             stream: Arc::new(Mutex::new(stream)),
             fd,
+            sock: SocketWrapper::from_fd(py, fd, sfamily, socket2::Type::STREAM, 0),
             pyloop,
             proto: proto.unbind(),
             extra: HashMap::new(),
             buffered_proto,
             closing: false.into(),
-            reading: false.into(),
+            paused: false.into(),
             paused_proto: false.into(),
             buffer: VecDeque::new(),
             water_hi: wh.into(),
             water_lo: wl.into(),
+            weof: false.into(),
             pym_conn_made,
+            pym_conn_lost,
             pym_recv_data,
             pym_recv_eof,
             pym_buf_get,
@@ -142,8 +164,13 @@ impl TCPTransport {
         }
     }
 
-    pub(crate) fn attach(&self, py: Python) -> (PyObject, PyObject) {
-        (self.pym_conn_made.clone_ref(py), PyTuple::empty(py).into_any().unbind())
+    #[inline]
+    pub(crate) fn attach(pyself: Py<Self>, py: Python) -> CBHandle {
+        CBHandle::new1(
+            pyself.get().pym_conn_made.clone_ref(py),
+            pyself.into_any(),
+            copy_context(py),
+        )
     }
 
     // pub(crate) fn detach(&self) {
@@ -163,9 +190,8 @@ impl TCPTransport {
             return;
         }
 
-        let pyctx = copy_context(py).unwrap().as_ptr();
         let cb = rself.pym_write_pause.as_ptr();
-        let res = run_in_ctx0!(py, pyctx, cb);
+        let res = run_in_ctx0!(py, copy_context(py).as_ptr(), cb);
         if let Err(err) = res {
             let err_ctx = LogExc::transport(
                 err,
@@ -191,9 +217,8 @@ impl TCPTransport {
             return;
         }
 
-        let pyctx = copy_context(py).unwrap().as_ptr();
         let cb = rself.pym_write_resume.as_ptr();
-        let res = run_in_ctx0!(py, pyctx, cb);
+        let res = run_in_ctx0!(py, copy_context(py).as_ptr(), cb);
         if let Err(err) = res {
             let err_ctx = LogExc::transport(
                 err,
@@ -205,37 +230,51 @@ impl TCPTransport {
         }
     }
 
-    pub(crate) fn recv(&self, py: Python) -> (PyObject, PyObject) {
-        match self.buffered_proto {
+    #[inline]
+    pub(crate) fn recv(pyself: Py<Self>, py: Python) -> CBHandle {
+        let rself = pyself.get();
+        match rself.buffered_proto {
             true => {
                 // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
                 //       which is smth we can't really use to read from `TcpStream`.
                 //       So even if this sucks, we copy data back and forth, at least until
                 //       we figure out a way to actually use `PyBuffer` directly.
-                let pybuf: PyBuffer<u8> = PyBuffer::get(&self.pym_buf_get.bind(py).call0().unwrap()).unwrap();
+                let pybuf: PyBuffer<u8> = PyBuffer::get(&rself.pym_buf_get.bind(py).call0().unwrap()).unwrap();
                 let mut vbuf = pybuf.to_vec(py).unwrap();
-                let read = py.allow_threads(|| self.read_into(vbuf.as_mut_slice()));
-                pybuf.copy_from_slice(py, &vbuf[..]).unwrap();
-                let cb = self.pym_recv_data.clone_ref(py);
-                let args = (read,).into_py_any(py).unwrap();
-                (cb, args)
+                let read = py.allow_threads(|| rself.read_into(vbuf.as_mut_slice()));
+                if read == 0 {
+                    let cb = TCPTransportOnEof {
+                        transport: pyself.clone_ref(py),
+                    };
+                    CBHandle::new0(Py::new(py, cb).unwrap().into_any(), copy_context(py))
+                } else {
+                    pybuf.copy_from_slice(py, &vbuf[..]).unwrap();
+                    CBHandle::new1(
+                        rself.pym_recv_data.clone_ref(py),
+                        read.into_py_any(py).unwrap(),
+                        copy_context(py),
+                    )
+                }
             }
             false => {
-                let data = py.allow_threads(|| self.read());
-                let cb: PyObject;
-                let args: PyObject;
+                let data = py.allow_threads(|| rself.read());
                 if data.len() == 0 {
-                    cb = self.pym_recv_eof.clone_ref(py);
-                    args = PyTuple::empty(py).into_any().unbind();
+                    let cb = TCPTransportOnEof {
+                        transport: pyself.clone_ref(py),
+                    };
+                    CBHandle::new0(Py::new(py, cb).unwrap().into_any(), copy_context(py))
                 } else {
-                    cb = self.pym_recv_data.clone_ref(py);
-                    args = (&data[..],).into_py_any(py).unwrap();
+                    CBHandle::new1(
+                        rself.pym_recv_data.clone_ref(py),
+                        (&data[..]).into_py_any(py).unwrap(),
+                        copy_context(py),
+                    )
                 }
-                (cb, args)
             }
         }
     }
 
+    #[inline]
     fn read(&self) -> Box<[u8]> {
         let mut guard = self.stream.lock().unwrap();
         let mut len = 0;
@@ -253,6 +292,7 @@ impl TCPTransport {
         buf[..len].into()
     }
 
+    #[inline]
     fn read_into(&self, buf: &mut [u8]) -> usize {
         let mut guard = self.stream.lock().unwrap();
         let mut len = 0;
@@ -269,6 +309,27 @@ impl TCPTransport {
         len
     }
 
+    #[inline]
+    fn cb_eof(pyself: Py<Self>, py: Python) {
+        let rself = pyself.get();
+        match rself.pym_recv_eof.call0(py) {
+            Ok(ret) => match ret.is_truthy(py).unwrap() {
+                true => {
+                    rself
+                        .pyloop
+                        .get()
+                        .tcp_stream_rem(pyself.clone_ref(py), Interest::READABLE);
+                }
+                false => TCPTransport::close(pyself, py),
+            },
+            Err(err) => {
+                todo!()
+                // log fatal error
+                // force close
+            }
+        }
+    }
+
     // fn write2(&self) {}
 
     // fn force_close(&self) {}
@@ -278,19 +339,47 @@ impl TCPTransport {
 impl TCPTransport {
     #[pyo3(signature = (name, default = None))]
     fn get_extra_info(&self, py: Python, name: &str, default: Option<PyObject>) -> Option<PyObject> {
-        self.extra.get(name).map(|v| v.clone_ref(py)).or(default)
+        match name {
+            "socket" => Some(self.sock.clone_ref(py).into_any()),
+            "sockname" => match self.sock.call_method0(py, pyo3::intern!(py, "getsockname")) {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            },
+            "peername" => match self.sock.call_method0(py, pyo3::intern!(py, "getpeername")) {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            },
+            _ => self.extra.get(name).map(|v| v.clone_ref(py)).or(default),
+        }
     }
 
     fn is_closing(&self) -> bool {
         self.closing.load(atomic::Ordering::Relaxed)
     }
 
-    fn close(&self) {
-        todo!()
+    fn close(pyself: Py<Self>, py: Python) {
+        let rself = pyself.get();
+        if rself
+            .closing
+            .compare_exchange(false, true, atomic::Ordering::Release, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let event_loop = rself.pyloop.get();
+        event_loop.tcp_stream_rem(pyself.clone_ref(py), Interest::READABLE);
+        if rself.buffer.len() == 0 {
+            // TODO: set conn lost
+            event_loop.tcp_stream_rem(pyself.clone_ref(py), Interest::WRITABLE);
+            event_loop.schedule0(py, rself.pym_conn_lost.clone_ref(py), Some(copy_context(py)));
+        }
     }
 
     fn set_protocol(&self, _protocol: PyObject) -> PyResult<()> {
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(""))
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "TCPTransport protocol cannot be changed",
+        ))
     }
 
     fn get_protocol(&self, py: Python) -> PyObject {
@@ -298,15 +387,43 @@ impl TCPTransport {
     }
 
     fn is_reading(&self) -> bool {
-        self.reading.load(atomic::Ordering::Relaxed)
+        !self.closing.load(atomic::Ordering::Relaxed) && !self.paused.load(atomic::Ordering::Relaxed)
     }
 
-    fn pause_reading(&self) {
-        todo!()
+    fn pause_reading(pyself: Py<Self>, py: Python) {
+        let rself = pyself.get();
+        if rself.closing.load(atomic::Ordering::Relaxed) {
+            return;
+        }
+        if rself
+            .paused
+            .compare_exchange(false, true, atomic::Ordering::Release, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        rself
+            .pyloop
+            .get()
+            .tcp_stream_rem(pyself.clone_ref(py), Interest::READABLE);
     }
 
-    fn resume_reading(&self) {
-        todo!()
+    fn resume_reading(pyself: Py<Self>, py: Python) {
+        let rself = pyself.get();
+        if rself.closing.load(atomic::Ordering::Relaxed) {
+            return;
+        }
+        if rself
+            .paused
+            .compare_exchange(true, false, atomic::Ordering::Release, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        rself
+            .pyloop
+            .get()
+            .tcp_stream_add(pyself.clone_ref(py), Interest::READABLE);
     }
 
     #[pyo3(signature = (high = None, low = None))]
@@ -367,7 +484,20 @@ impl TCPTransport {
     }
 
     fn write_eof(&self) {
-        todo!()
+        if self.closing.load(atomic::Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .weof
+            .compare_exchange(false, true, atomic::Ordering::Release, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if self.buffer.len() == 0 {
+            let stream = self.stream.lock().unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
     }
 
     fn can_write_eof(&self) -> bool {
@@ -379,8 +509,14 @@ impl TCPTransport {
     }
 }
 
-// pub(super) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
-//     // module.add_class::<TCPServer>()?;
+#[pyclass(frozen)]
+struct TCPTransportOnEof {
+    transport: Py<TCPTransport>,
+}
 
-//     Ok(())
-// }
+#[pymethods]
+impl TCPTransportOnEof {
+    fn __call__(&self, py: Python) {
+        TCPTransport::cb_eof(self.transport.clone_ref(py), py);
+    }
+}

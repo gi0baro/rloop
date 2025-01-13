@@ -1,9 +1,12 @@
 import asyncio
+import asyncio.trsock
 
 from ._rloop import Server as _Server
 
 
 class Server(_Server):
+    __slots__ = []
+
     def get_loop(self):
         return self._loop
 
@@ -56,4 +59,4 @@ class Server(_Server):
     # TODO
     @property
     def sockets(self):
-        raise NotImplementedError
+        return tuple(asyncio.trsock.TransportSocket(s) for s in self._sockets)

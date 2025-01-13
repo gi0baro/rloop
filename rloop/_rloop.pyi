@@ -51,6 +51,7 @@ class EventLoop:
 class Server:
     _loop: Any
     _sff: Any
+    _sockets: list[int]
 
     def _add_waiter(self, waiter): ...
     def _start_serving(self): ...

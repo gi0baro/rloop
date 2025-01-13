@@ -14,6 +14,8 @@ enum ServerType {
 pub(crate) struct Server {
     #[pyo3(get)]
     _loop: Py<EventLoop>,
+    #[pyo3(get)]
+    _sockets: PyObject,
     closed: atomic::AtomicBool,
     serving: atomic::AtomicBool,
     servers: Vec<ServerType>,
@@ -22,11 +24,12 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub(crate) fn tcp(event_loop: Py<EventLoop>, servers: Vec<TCPServer>) -> Self {
+    pub(crate) fn tcp(event_loop: Py<EventLoop>, sockets: PyObject, servers: Vec<TCPServer>) -> Self {
         let srv: Vec<ServerType> = servers.into_iter().map(|v| ServerType::TCP(v)).collect();
 
         Self {
             _loop: event_loop,
+            _sockets: sockets,
             closed: false.into(),
             serving: false.into(),
             servers: srv,

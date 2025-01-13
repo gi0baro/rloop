@@ -413,18 +413,21 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                 raise ValueError(f'A Stream Socket was expected, got {sock!r}')
             sockets = [sock]
 
+        rsocks = []
         for sock in sockets:
             sock.setblocking(False)
+            rsocks.append((sock.fileno(), sock.family))
+            sock.detach()
 
         # TODO
         # server = Server(self, sockets, protocol_factory,
         #                 ssl, backlog, ssl_handshake_timeout,
         #                 ssl_shutdown_timeout)
-        server = self._tcp_server([sock.fileno() for sock in sockets], protocol_factory, backlog)
+        server = self._tcp_server(sockets, rsocks, protocol_factory, backlog)
 
         # TODO
-        # if start_serving:
-        #     server._start_serving()
+        if start_serving:
+            server._start_serving()
         #     # Skip one loop iteration so that all 'loop.add_reader'
         #     # go through.
         #     await tasks.sleep(0)
