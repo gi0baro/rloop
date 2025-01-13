@@ -89,7 +89,7 @@ def raw():
     results = {}
     for loop in LOOPS:
         with server(loop):
-            results[loop] = benchmark(concurrencies=CONCURRENCIES[0])
+            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
@@ -97,7 +97,7 @@ def stream():
     results = {}
     for loop in LOOPS:
         with server(loop, streams=True):
-            results[loop] = benchmark(concurrencies=CONCURRENCIES[0])
+            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
@@ -105,7 +105,7 @@ def proto():
     results = {}
     for loop in LOOPS:
         with server(loop, proto=True):
-            results[loop] = benchmark(concurrencies=CONCURRENCIES[0])
+            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
