@@ -1,12 +1,17 @@
 use pyo3::prelude::*;
 use std::sync::OnceLock;
 
-mod event_loop;
+pub mod event_loop;
 mod handles;
 mod io;
+mod log;
 mod py;
+mod server;
+mod sock;
+mod tcp;
+mod time;
 
-pub fn get_lib_version() -> &'static str {
+pub(crate) fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
 
     LIB_VERSION.get_or_init(|| {
@@ -21,5 +26,7 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
 
     event_loop::init_pymodule(module)?;
     handles::init_pymodule(module)?;
+    server::init_pymodule(module)?;
+
     Ok(())
 }
