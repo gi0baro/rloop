@@ -5,6 +5,10 @@ import socket
 _HAS_IPv6 = hasattr(socket, 'AF_INET6')
 
 
+def _noop(*args, **kwargs):
+    return
+
+
 def _can_use_pidfd():
     if not hasattr(os, 'pidfd_open'):
         return False
@@ -75,5 +79,10 @@ def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
     return None
 
 
-def _noop(*args, **kwargs):
-    return
+def _set_reuseport(sock):
+    if not hasattr(socket, 'SO_REUSEPORT'):
+        raise ValueError('reuse_port not supported by socket module')
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+        raise ValueError('reuse_port not supported by socket module, SO_REUSEPORT defined but not implemented.')

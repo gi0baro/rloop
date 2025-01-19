@@ -1,89 +1,67 @@
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     io::{Read, Write},
     mem,
-    os::fd::FromRawFd,
+    os::fd::{AsRawFd, FromRawFd},
     sync::{atomic, Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use dashmap::DashMap;
-use mio::{Events, Interest, Poll, Token};
-use pyo3::{prelude::*, types::PyDict};
+use mio::{event, net::TcpListener, Interest, Poll, Token};
+use pyo3::prelude::*;
 
-use crate::handles::{CBHandle, TimerHandle};
-use crate::io::{InternalIO, Source};
-use crate::py::{copy_context, weakset};
+use crate::{
+    handles::{CBHandle, HandleRef, PyHandle, PyTimerHandle},
+    io::Source,
+    log::{log_exc_to_py_ctx, LogExc},
+    py::{copy_context, weakset},
+    server::Server,
+    tcp::{TCPServer, TCPServerRef, TCPStream},
+    time::Timer,
+};
 
-struct Timer {
-    pub handle: Py<CBHandle>,
-    when: u128,
+enum Handle {
+    Internal(Source),
+    Py(PyHandleData),
+    TCPListener(TCPListenerHandleData),
+    TCPStream(TCPStreamHandleData),
 }
 
-impl PartialEq for Timer {
-    fn eq(&self, _other: &Self) -> bool {
-        false
-    }
-}
-
-impl Eq for Timer {}
-
-impl PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Timer {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.when < other.when {
-            return Ordering::Greater;
-        }
-        if self.when > other.when {
-            return Ordering::Less;
-        }
-        Ordering::Equal
-    }
-}
-
-enum IOHandle {
-    Internal(IOHandleData),
-    Py(PyIOHandleData),
-}
-
-struct IOHandleData {
-    source: Source,
-    #[allow(dead_code)]
-    interest: Interest,
-    handle: InternalIO,
-}
-
-struct PyIOHandleData {
+struct PyHandleData {
     source: Source,
     interest: Interest,
-    cbr: Option<Py<CBHandle>>,
-    cbw: Option<Py<CBHandle>>,
+    cbr: Option<HandleRef>,
+    cbw: Option<HandleRef>,
+}
+
+struct TCPListenerHandleData {
+    source: Source,
+    server: TCPServerRef,
+}
+
+struct TCPStreamHandleData {
+    source: Source,
+    interest: Interest,
 }
 
 #[pyclass(frozen, subclass)]
-struct EventLoop {
+pub struct EventLoop {
     idle: atomic::AtomicBool,
     io: Arc<Mutex<Poll>>,
-    handles_io: Arc<DashMap<Token, IOHandle>>,
-    handles_ready: Arc<Mutex<VecDeque<Py<CBHandle>>>>,
+    handles_io: Arc<DashMap<Token, Handle>>,
+    handles_ready: Arc<Mutex<VecDeque<HandleRef>>>,
     handles_sched: Arc<Mutex<BinaryHeap<Timer>>>,
     epoch: Instant,
     counter_ready: atomic::AtomicUsize,
-    counter_io: atomic::AtomicU16,
     ssock: Arc<RwLock<Option<(socket2::Socket, socket2::Socket)>>>,
     tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
     exc_handler: Arc<RwLock<PyObject>>,
     exception_handler: Arc<RwLock<PyObject>>,
     executor: Arc<RwLock<PyObject>>,
-    sig_handlers: Arc<DashMap<u8, Py<CBHandle>>>,
+    sig_handlers: Arc<DashMap<u8, HandleRef>>,
     sig_listening: atomic::AtomicBool,
     sig_loop_handled: atomic::AtomicBool,
     sig_wfd: Arc<RwLock<PyObject>>,
@@ -93,18 +71,22 @@ struct EventLoop {
     ssock_r: Arc<RwLock<PyObject>>,
     ssock_w: Arc<RwLock<PyObject>>,
     task_factory: Arc<RwLock<PyObject>>,
+    tcp_lstreams: DashMap<usize, HashSet<usize>>,
+    tcp_streams: DashMap<usize, TCPStream>,
     thread_id: atomic::AtomicI64,
     watcher_child: Arc<RwLock<PyObject>>,
     #[pyo3(get)]
     _asyncgens: PyObject,
     #[pyo3(get)]
     _base_ctx: PyObject,
+    // #[pyo3(get)]
+    // _transports: PyObject,
 }
 
 impl EventLoop {
     #[inline]
     fn step(&self, py: Python) -> std::result::Result<(), std::io::Error> {
-        let mut io_events = Events::with_capacity(128);
+        let mut io_events = event::Events::with_capacity(128);
         let mut sched_time: Option<u64> = None;
         let mut skip_poll = false;
 
@@ -158,26 +140,19 @@ impl EventLoop {
             .fetch_sub(cb_handles.len(), atomic::Ordering::Relaxed);
         drop(guard_cb);
 
-        for event in &io_events {
-            // NOTE: cancellation is not necessary as we have custom futures
-            if let Some(io_handle) = self.handles_io.get(&event.token()) {
-                match io_handle.value() {
-                    IOHandle::Py(handle) => {
-                        if let Some(cbr) = &handle.cbr {
-                            if event.is_readable() {
-                                cb_handles.push_back(cbr.clone_ref(py));
-                            }
-                        }
-                        if let Some(cbw) = &handle.cbw {
-                            if event.is_writable() {
-                                cb_handles.push_back(cbw.clone_ref(py));
-                            }
-                        }
+        py.allow_threads(|| {
+            for event in &io_events {
+                // NOTE: cancellation is not necessary as we have custom futures
+                if let Some(io_handle) = self.handles_io.get(&event.token()) {
+                    match io_handle.value() {
+                        Handle::Py(handle) => self.handle_io_py(event, handle, &mut cb_handles),
+                        Handle::TCPListener(handle) => self.handle_io_tcpl(handle, &mut cb_handles),
+                        Handle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
+                        Handle::Internal(_) => self.handle_io_internal(&mut cb_handles),
                     }
-                    IOHandle::Internal(handle) => self.handle_internal_io(handle, py, &mut cb_handles),
                 }
             }
-        }
+        });
 
         // timers
         let mut guard_sched = self.handles_sched.lock().unwrap();
@@ -195,23 +170,9 @@ impl EventLoop {
         drop(guard_sched);
 
         // callbacks
-        while let Some(cb_handle) = cb_handles.pop_front() {
-            // let handle = match cb_handle {
-            //     Handle::Callback(ref v) => v.get(),
-            //     Handle::IO(ref v) => v,
-            //     // _ => unreachable!()
-            // };
-            let handle = cb_handle.get();
-            if !handle.cancelled.load(atomic::Ordering::Relaxed) {
-                if let Some((err, msg)) = handle.run(py) {
-                    let err_ctx = PyDict::new(py);
-                    err_ctx.set_item(pyo3::intern!(py, "exception"), err).unwrap();
-                    err_ctx.set_item(pyo3::intern!(py, "message"), msg).unwrap();
-                    err_ctx
-                        .set_item(pyo3::intern!(py, "handle"), cb_handle.clone_ref(py))
-                        .unwrap();
-                    let _ = self.log_exception(py, err_ctx);
-                }
+        while let Some(handle) = cb_handles.pop_front() {
+            if !handle.cancelled() {
+                handle.run(py, self);
             }
         }
 
@@ -219,26 +180,86 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_internal_io(&self, handle_data: &IOHandleData, py: Python, handles_ready: &mut VecDeque<Py<CBHandle>>) {
-        match handle_data.handle {
-            InternalIO::Signals => {
-                let sigs = py.allow_threads(|| self.read_from_self());
-                for sig in sigs {
-                    self.sig_handle(py, sig, handles_ready);
-                }
+    fn handle_io_py(&self, event: &event::Event, handle: &PyHandleData, handles: &mut VecDeque<HandleRef>) {
+        if let Some(cbr) = &handle.cbr {
+            if event.is_readable() {
+                handles.push_back(cbr.clone());
+            }
+        }
+        if let Some(cbw) = &handle.cbw {
+            if event.is_writable() {
+                handles.push_back(cbw.clone());
             }
         }
     }
 
     #[inline]
-    fn sig_handle(&self, py: Python, sig: u8, handles_ready: &mut VecDeque<Py<CBHandle>>) {
-        if let Some(pyhandle) = self.sig_handlers.get(&sig) {
+    fn handle_io_tcpl(&self, handle: &TCPListenerHandleData, handles: &mut VecDeque<HandleRef>) {
+        match &handle.source {
+            Source::TCPListener(listener) => {
+                while let Ok((stream, _)) = listener.accept() {
+                    let fd = stream.as_raw_fd() as usize;
+                    let (stream_ref, stream_handle) = Python::with_gil(|py| handle.server.new_stream(py, stream));
+                    self.tcp_streams.insert(fd, stream_ref);
+                    self.tcp_lstreams.alter(&handle.server.fd, |_, mut v| {
+                        v.insert(fd);
+                        v
+                    });
+                    // println!("tcp_stream_add {:?}", fd);
+                    self.tcp_stream_add(fd, Interest::READABLE);
+                    handles.push_back(stream_handle);
+                }
+                // loop {
+                //     match listener.accept() {
+                //         Ok((stream, _)) => {
+                //             let fd = stream.as_raw_fd() as usize;
+                //             let (streamref, handle) = Python::with_gil(|py| handle.server.new_stream(py, stream));
+                //             self.tcp_streams.insert(fd, streamref);
+                //             self.tcp_stream_add(fd, Interest::READABLE);
+                //             handles.push_back(handle.into());
+                //         }
+                //         // TODO: failure handling
+                //         // Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                //         // Err(_) => {}
+                //         Err(_) => break,
+                //     }
+                // }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>) {
+        let fd = event.token().0;
+        // println!("handle_io_tcps {:?}", fd);
+        let mut stream_ref = self.tcp_streams.get_mut(&fd).unwrap();
+        let io = stream_ref.value_mut();
+
+        if event.is_readable() {
+            handles_ready.push_back(io.recv(event, fd));
+        } else if event.is_writable() {
+            handles_ready.push_back(io.send(event, fd));
+        }
+    }
+
+    #[inline]
+    fn handle_io_internal(&self, handles_ready: &mut VecDeque<HandleRef>) {
+        let sigs = self.read_from_self();
+        for sig in sigs {
+            self.sig_handle(sig, handles_ready);
+        }
+    }
+
+    #[inline]
+    fn sig_handle(&self, sig: u8, handles_ready: &mut VecDeque<HandleRef>) {
+        if let Some(handle) = self.sig_handlers.get(&sig) {
             self.sig_loop_handled.store(true, atomic::Ordering::Relaxed);
 
-            if pyhandle.get().cancelled.load(atomic::Ordering::Relaxed) {
+            if handle.cancelled() {
                 self._sig_rem(sig);
             } else {
-                handles_ready.push_back(pyhandle.clone_ref(py));
+                handles_ready.push_back(handle.clone());
             }
         }
     }
@@ -280,65 +301,217 @@ impl EventLoop {
         Vec::new()
     }
 
-    #[inline]
-    fn reader_rem(&self, token: Token) -> Result<bool> {
-        if let Some((_, IOHandle::Py(mut item))) = self.handles_io.remove(&token) {
-            let guard_poll = self.io.lock().unwrap();
-            match item.interest {
-                Interest::READABLE => {
-                    self.counter_io.fetch_sub(1, atomic::Ordering::Relaxed);
+    pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
+        let fd = listener.as_raw_fd() as usize;
+        let token = Token(fd);
+        let mut source = Source::TCPListener(listener);
+        let guard_poll = self.io.lock().unwrap();
+        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
+        self.tcp_lstreams.insert(fd, HashSet::new());
+        self.handles_io
+            .insert(token, Handle::TCPListener(TCPListenerHandleData { source, server }));
+    }
+
+    pub(crate) fn tcp_listener_rem(&self, fd: usize) -> Result<bool> {
+        let token = Token(fd);
+        if let Some((_, handle)) = self.handles_io.remove(&token) {
+            match handle {
+                Handle::TCPListener(mut item) => {
+                    self.tcp_lstreams.remove(&fd);
+                    let guard_poll = self.io.lock().unwrap();
                     guard_poll.registry().deregister(&mut item.source)?;
+                    return Ok(true);
                 }
-                _ => {
-                    let interest = Interest::WRITABLE;
-                    guard_poll.registry().reregister(&mut item.source, token, interest)?;
-                    self.handles_io.insert(
-                        token,
-                        IOHandle::Py(PyIOHandleData {
-                            source: item.source,
-                            interest,
-                            cbr: None,
-                            cbw: item.cbw,
-                        }),
-                    );
-                }
+                _ => unreachable!(),
             }
-            return Ok(true);
         }
         Ok(false)
     }
 
-    #[inline]
-    fn writer_rem(&self, token: Token) -> Result<bool> {
-        if let Some((_, IOHandle::Py(mut item))) = self.handles_io.remove(&token) {
-            let guard_poll = self.io.lock().unwrap();
-            match item.interest {
-                Interest::WRITABLE => {
-                    self.counter_io.fetch_sub(1, atomic::Ordering::Relaxed);
-                    guard_poll.registry().deregister(&mut item.source)?;
+    pub(crate) fn tcp_stream_add(&self, fd: usize, interest: Interest) {
+        let token = Token(fd);
+        let guard_poll = self.io.lock().unwrap();
+        match self.handles_io.remove(&token) {
+            Some((_, Handle::TCPStream(mut item))) => {
+                if item.interest == interest {
+                    let _ = guard_poll.registry().reregister(&mut item.source, token, item.interest);
+                    return;
                 }
-                _ => {
-                    let interest = Interest::READABLE;
-                    guard_poll.registry().reregister(&mut item.source, token, interest)?;
-                    self.handles_io.insert(
-                        token,
-                        IOHandle::Py(PyIOHandleData {
-                            source: item.source,
-                            interest,
-                            cbr: item.cbr,
-                            cbw: None,
-                        }),
-                    );
-                }
+
+                let interests = interest | item.interest;
+                let _ = guard_poll.registry().reregister(&mut item.source, token, interests);
+                drop(guard_poll);
+
+                self.handles_io.insert(
+                    token,
+                    Handle::TCPStream(TCPStreamHandleData {
+                        source: item.source,
+                        interest: interests,
+                    }),
+                );
             }
-            return Ok(true);
+            _ => {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::TCPStream(fd as i32);
+                let _ = guard_poll.registry().register(&mut source, token, interest);
+                drop(guard_poll);
+
+                self.handles_io
+                    .insert(token, Handle::TCPStream(TCPStreamHandleData { source, interest }));
+            }
         }
-        Ok(false)
     }
 
-    fn log_exception(&self, py: Python, ctx: Bound<PyDict>) -> PyResult<PyObject> {
+    pub(crate) fn tcp_stream_rem(&self, fd: usize, interest: Interest) {
+        let token = Token(fd);
+        let guard_poll = self.io.lock().unwrap();
+
+        if let Some((_, Handle::TCPStream(mut item))) = self.handles_io.remove(&token) {
+            let interests = item.interest.remove(interest);
+            if interests.is_none() {
+                let _ = guard_poll.registry().deregister(&mut item.source);
+                return;
+            }
+
+            let _ = guard_poll
+                .registry()
+                .reregister(&mut item.source, token, interests.unwrap());
+            drop(guard_poll);
+
+            self.handles_io.insert(
+                token,
+                Handle::TCPStream(TCPStreamHandleData {
+                    source: item.source,
+                    interest: interests.unwrap(),
+                }),
+            );
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn tcp_stream_shutdown(&self, fd: usize) {
+        // println!("tcp_stream_shutdown {:?}", fd);
+        if let Some(mut stream) = self.tcp_streams.get_mut(&fd) {
+            _ = stream.value_mut().io.shutdown(std::net::Shutdown::Write);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn tcp_stream_close(&self, fd: usize) {
+        // println!("tcp_stream_close {:?}", fd);
+        if let Some((_, stream)) = self.tcp_streams.remove(&fd) {
+            self.tcp_lstreams.alter(&stream.lfd, |_, mut v| {
+                v.remove(&fd);
+                v
+            });
+        }
+    }
+
+    pub(crate) fn with_tcp_listener_streams<T, R>(&self, fd: usize, func: T) -> R
+    where
+        T: FnOnce(&HashSet<usize>) -> R,
+    {
+        let streams_ref = self.tcp_lstreams.get(&fd).unwrap();
+        let io = streams_ref.value();
+        func(io)
+    }
+
+    pub(crate) fn with_tcp_stream<T, R>(&self, fd: usize, func: T) -> R
+    where
+        T: FnOnce(&mut TCPStream) -> R,
+    {
+        let mut stream_ref = self.tcp_streams.get_mut(&fd).unwrap();
+        let io = stream_ref.value_mut();
+        func(io)
+    }
+
+    pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {
         let handler = self.exc_handler.read().unwrap();
-        handler.call1(py, (ctx, self.exception_handler.read().unwrap().clone_ref(py)))
+        handler.call1(
+            py,
+            (
+                log_exc_to_py_ctx(py, ctx),
+                self.exception_handler.read().unwrap().clone_ref(py),
+            ),
+        )
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule0(&self, callback: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let handle = Arc::new(CBHandle::new0(callback, pyctx));
+        let mut handles = self.handles_ready.lock().expect("cannot lock handles");
+        handles.push_back(handle);
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
+        drop(handles);
+        if self.idle.load(atomic::Ordering::Relaxed) {
+            self.wake();
+        }
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule1(&self, callback: PyObject, arg: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let handle = Arc::new(CBHandle::new1(callback, arg, pyctx));
+        let mut handles = self.handles_ready.lock().expect("cannot lock handles");
+        handles.push_back(handle);
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
+        drop(handles);
+        if self.idle.load(atomic::Ordering::Relaxed) {
+            self.wake();
+        }
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule(&self, callback: PyObject, args: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let handle = Arc::new(CBHandle::new(callback, args, pyctx));
+        let mut handles = self.handles_ready.lock().expect("cannot lock handles");
+        handles.push_back(handle);
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
+        drop(handles);
+        if self.idle.load(atomic::Ordering::Relaxed) {
+            self.wake();
+        }
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule_later0(&self, delay: Duration, callback: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let handle = Arc::new(CBHandle::new0(callback, pyctx));
+        let timer = Timer {
+            handle: handle.clone(),
+            when,
+        };
+        let mut guard = self.handles_sched.lock().expect("cannot lock handles");
+        guard.push(timer);
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule_later1(&self, delay: Duration, callback: PyObject, arg: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let handle = Arc::new(CBHandle::new1(callback, arg, pyctx));
+        let timer = Timer {
+            handle: handle.clone(),
+            when,
+        };
+        let mut guard = self.handles_sched.lock().expect("cannot lock handles");
+        guard.push(timer);
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn schedule_later(&self, delay: Duration, callback: PyObject, args: PyObject, context: Option<PyObject>) {
+        let pyctx = context.unwrap_or_else(|| Python::with_gil(|py| self._base_ctx.clone_ref(py)));
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let handle = Arc::new(CBHandle::new(callback, args, pyctx));
+        let timer = Timer {
+            handle: handle.clone(),
+            when,
+        };
+        let mut guard = self.handles_sched.lock().expect("cannot lock handles");
+        guard.push(timer);
     }
 }
 
@@ -351,10 +524,11 @@ impl EventLoop {
             io: Arc::new(Mutex::new(Poll::new()?)),
             handles_io: Arc::new(DashMap::with_capacity(128)),
             handles_ready: Arc::new(Mutex::new(VecDeque::with_capacity(128))),
+            // handles_ready2: Arc::new(Mutex::new(VecDeque::with_capacity(128))),
             handles_sched: Arc::new(Mutex::new(BinaryHeap::with_capacity(32))),
             epoch: Instant::now(),
             counter_ready: atomic::AtomicUsize::new(0),
-            counter_io: atomic::AtomicU16::new(0),
+            // counter_io: atomic::AtomicU16::new(0),
             ssock: Arc::new(RwLock::new(None)),
             tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
@@ -371,10 +545,13 @@ impl EventLoop {
             ssock_r: Arc::new(RwLock::new(py.None())),
             ssock_w: Arc::new(RwLock::new(py.None())),
             task_factory: Arc::new(RwLock::new(py.None())),
+            tcp_streams: DashMap::with_capacity(1024),
+            tcp_lstreams: DashMap::with_capacity(32),
             thread_id: atomic::AtomicI64::new(0),
             watcher_child: Arc::new(RwLock::new(py.None())),
             _asyncgens: weakset(py)?.unbind(),
-            _base_ctx: copy_context(py)?.unbind(),
+            _base_ctx: copy_context(py),
+            // _transports: weakvaldict(py)?.unbind(),
         })
     }
 
@@ -548,45 +725,33 @@ impl EventLoop {
         let guard_poll = self.io.lock().unwrap();
         guard_poll.registry().register(&mut source, token, interest)?;
         drop(guard_poll);
-        self.handles_io.insert(
-            token,
-            IOHandle::Internal(IOHandleData {
-                source,
-                interest,
-                handle: InternalIO::Signals,
-            }),
-        );
+        self.handles_io.insert(token, Handle::Internal(source));
 
         Ok(())
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
         let token = Token(fd_r);
-        if let Some((_, IOHandle::Internal(mut item))) = self.handles_io.remove(&token) {
+        if let Some((_, Handle::Internal(mut source))) = self.handles_io.remove(&token) {
             let guard_poll = self.io.lock().unwrap();
-            guard_poll.registry().deregister(&mut item.source)?;
+            guard_poll.registry().deregister(&mut source)?;
         }
         self.ssock.write().unwrap().take();
         Ok(())
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(
-        &self,
-        py: Python,
-        callback: PyObject,
-        args: PyObject,
-        context: Option<PyObject>,
-    ) -> PyResult<Py<CBHandle>> {
-        let handle = Py::new(
-            py,
-            CBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
-        )?;
+    fn call_soon(&self, py: Python, callback: PyObject, args: PyObject, context: Option<PyObject>) -> PyHandle {
+        let handle = Arc::new(CBHandle::new(
+            callback,
+            args,
+            context.unwrap_or_else(|| copy_context(py)),
+        ));
         let mut guard = self.handles_ready.lock().unwrap();
-        guard.push_back(handle.clone_ref(py));
-        self.counter_ready.fetch_add(1, atomic::Ordering::Relaxed);
+        guard.push_back(handle.clone());
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
         drop(guard);
-        Ok(handle)
+        PyHandle { handle }
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
@@ -596,136 +761,196 @@ impl EventLoop {
         callback: PyObject,
         args: PyObject,
         context: Option<PyObject>,
-    ) -> PyResult<Py<CBHandle>> {
-        let handle = Py::new(
-            py,
-            CBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
-        )?;
+    ) -> PyHandle {
+        let handle = Arc::new(CBHandle::new(
+            callback,
+            args,
+            context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
+        ));
         let mut guard = self.handles_ready.lock().unwrap();
-        guard.push_back(handle.clone_ref(py));
-        self.counter_ready.fetch_add(1, atomic::Ordering::Relaxed);
+        guard.push_back(handle.clone());
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
         drop(guard);
         // wake when necessary
         if self.idle.load(atomic::Ordering::Relaxed) {
             py.allow_threads(|| self.wake());
         }
-        Ok(handle)
+        PyHandle { handle }
     }
 
-    fn _call_later(
-        &self,
-        py: Python,
-        delay: u64,
-        callback: PyObject,
-        args: PyObject,
-        context: PyObject,
-    ) -> PyResult<Py<TimerHandle>> {
+    fn _call_later(&self, delay: u64, callback: PyObject, args: PyObject, context: PyObject) -> PyTimerHandle {
         let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
-        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
-        let thandle = Py::new(py, TimerHandle::new(handle.clone_ref(py), when))?;
+        let handle = Arc::new(CBHandle::new(callback, args, context));
+        let timer = Timer {
+            handle: handle.clone(),
+            when,
+        };
         let mut guard = self.handles_sched.lock().unwrap();
-        guard.push(Timer { handle, when });
+        guard.push(timer);
         drop(guard);
-        Ok(thandle)
+        PyTimerHandle::new(handle, when)
     }
 
-    fn _reader_add(
-        &self,
-        py: Python,
-        fd: usize,
-        callback: PyObject,
-        args: PyObject,
-        context: PyObject,
-    ) -> PyResult<Py<CBHandle>> {
+    fn _reader_add(&self, fd: usize, callback: PyObject, args: PyObject, context: PyObject) -> PyHandle {
         let token = Token(fd);
-        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
-        if let Some(mut item) = self.handles_io.get_mut(&token) {
-            if let IOHandle::Py(data) = item.value_mut() {
-                let interest = data.interest | Interest::READABLE;
-                let guard_poll = self.io.lock().unwrap();
-                guard_poll.registry().reregister(&mut data.source, token, interest)?;
-                drop(guard_poll);
-                data.interest = interest;
-                data.cbr = Some(handle.clone_ref(py));
-                return Ok(handle);
+        let handle = Arc::new(CBHandle::new(callback, args, context));
+
+        self.handles_io
+            .entry(token)
+            .and_modify(|io_handle| match io_handle {
+                Handle::Py(data) => {
+                    let interest = data.interest | Interest::READABLE;
+                    {
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut data.source, token, interest);
+                    }
+                    data.interest = interest;
+                    data.cbr = Some(handle.clone());
+                }
+                _ => unreachable!(),
+            })
+            .or_insert_with(|| {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                let interest = Interest::READABLE;
+                {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().register(&mut source, token, interest);
+                }
+                Handle::Py(PyHandleData {
+                    source,
+                    interest,
+                    cbr: Some(handle.clone()),
+                    cbw: None,
+                })
+            });
+
+        PyHandle { handle }
+    }
+
+    fn _reader_rem(&self, fd: usize) -> bool {
+        let token = Token(fd);
+        if let Some((_, io_handle)) = self.handles_io.remove_if(&token, |_, io_handle| {
+            if let Handle::Py(handle) = io_handle {
+                return handle.interest == Interest::READABLE;
             }
+            false
+        }) {
+            match io_handle {
+                Handle::Py(mut handle) => {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().deregister(&mut handle.source);
+                }
+                _ => unreachable!(),
+            }
+            return true;
         }
 
-        let mut source = Source::FD(fd.try_into()?);
-        let interest = Interest::READABLE;
-        let guard_poll = self.io.lock().unwrap();
-        guard_poll.registry().register(&mut source, token, interest)?;
-        drop(guard_poll);
-        self.handles_io.insert(
-            token,
-            IOHandle::Py(PyIOHandleData {
-                source,
-                interest,
-                cbr: Some(handle.clone_ref(py)),
-                cbw: None,
-            }),
-        );
-        self.counter_io.fetch_add(1, atomic::Ordering::Relaxed);
-
-        Ok(handle)
-    }
-
-    fn _reader_rem(&self, fd: usize) -> Result<bool> {
-        let token = Token(fd);
-        self.reader_rem(token)
-    }
-
-    fn _writer_add(
-        &self,
-        py: Python,
-        fd: usize,
-        callback: PyObject,
-        args: PyObject,
-        context: PyObject,
-    ) -> PyResult<Py<CBHandle>> {
-        let token = Token(fd);
-        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
-
-        if let Some(mut item) = self.handles_io.get_mut(&token) {
-            if let IOHandle::Py(data) = item.value_mut() {
-                let interest = data.interest | Interest::WRITABLE;
+        let mut altered = false;
+        self.handles_io.alter(&token, |_, mut io_handle| {
+            if let Handle::Py(handle) = &mut io_handle {
+                handle.interest = Interest::WRITABLE;
+                handle.cbr = None;
                 let guard_poll = self.io.lock().unwrap();
-                guard_poll.registry().reregister(&mut data.source, token, interest)?;
-                drop(guard_poll);
-                data.interest = interest;
-                data.cbw = Some(handle.clone_ref(py));
-                return Ok(handle);
+                _ = guard_poll
+                    .registry()
+                    .reregister(&mut handle.source, token, handle.interest);
+                altered = true;
             }
+            io_handle
+        });
+        altered
+    }
+
+    fn _writer_add(&self, fd: usize, callback: PyObject, args: PyObject, context: PyObject) -> PyHandle {
+        let token = Token(fd);
+        let handle = Arc::new(CBHandle::new(callback, args, context));
+
+        self.handles_io
+            .entry(token)
+            .and_modify(|io_handle| match io_handle {
+                Handle::Py(data) => {
+                    let interest = data.interest | Interest::WRITABLE;
+                    {
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut data.source, token, interest);
+                    }
+                    data.interest = interest;
+                    data.cbw = Some(handle.clone());
+                }
+                _ => unreachable!(),
+            })
+            .or_insert_with(|| {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                let interest = Interest::WRITABLE;
+                {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().register(&mut source, token, interest);
+                }
+                Handle::Py(PyHandleData {
+                    source,
+                    interest,
+                    cbr: None,
+                    cbw: Some(handle.clone()),
+                })
+            });
+        PyHandle { handle }
+    }
+
+    fn _writer_rem(&self, fd: usize) -> bool {
+        let token = Token(fd);
+        if let Some((_, io_handle)) = self.handles_io.remove_if(&token, |_, io_handle| {
+            if let Handle::Py(handle) = io_handle {
+                return handle.interest == Interest::WRITABLE;
+            }
+            false
+        }) {
+            match io_handle {
+                Handle::Py(mut handle) => {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().deregister(&mut handle.source);
+                }
+                _ => unreachable!(),
+            }
+            return true;
         }
 
-        let mut source = Source::FD(fd.try_into()?);
-        let interest = Interest::WRITABLE;
-        let guard_poll = self.io.lock().unwrap();
-        guard_poll.registry().register(&mut source, token, interest)?;
-        drop(guard_poll);
-        self.handles_io.insert(
-            token,
-            IOHandle::Py(PyIOHandleData {
-                source,
-                interest,
-                cbr: None,
-                cbw: Some(handle.clone_ref(py)),
-            }),
-        );
-        self.counter_io.fetch_add(1, atomic::Ordering::Relaxed);
-
-        Ok(handle)
+        let mut altered = false;
+        self.handles_io.alter(&token, |_, mut io_handle| {
+            if let Handle::Py(handle) = &mut io_handle {
+                handle.interest = Interest::READABLE;
+                handle.cbw = None;
+                let guard_poll = self.io.lock().unwrap();
+                _ = guard_poll
+                    .registry()
+                    .reregister(&mut handle.source, token, handle.interest);
+                altered = true;
+            }
+            io_handle
+        });
+        altered
     }
 
-    fn _writer_rem(&self, fd: usize) -> Result<bool> {
-        let token = Token(fd);
-        self.writer_rem(token)
+    fn _tcp_server(
+        pyself: Py<Self>,
+        py: Python,
+        socks: PyObject,
+        rsocks: Vec<(i32, i32)>,
+        protocol_factory: PyObject,
+        backlog: i32,
+    ) -> PyResult<Py<Server>> {
+        let mut servers = Vec::new();
+        for (fd, family) in rsocks {
+            servers.push(TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        Py::new(py, server)
     }
 
-    fn _sig_add(&self, py: Python, sig: u8, callback: PyObject, args: PyObject, context: PyObject) -> Result<()> {
-        let handle = Py::new(py, CBHandle::new(callback, args, context))?;
+    fn _sig_add(&self, sig: u8, callback: PyObject, args: PyObject, context: PyObject) {
+        let handle = Arc::new(CBHandle::new(callback, args, context));
         self.sig_handlers.insert(sig, handle);
-        Ok(())
     }
 
     fn _sig_rem(&self, sig: u8) -> bool {

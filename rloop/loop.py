@@ -1,5 +1,6 @@
 import asyncio as __asyncio
 import errno
+import os
 import signal
 import socket
 import subprocess
@@ -12,6 +13,7 @@ from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_futur
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context as _copy_context
+from itertools import chain as _iterchain
 from typing import Union
 
 from ._compat import _PY_311, _PYV
@@ -25,7 +27,7 @@ from .subprocess import (
     _SubProcessTransport,
     _ThreadedChildWatcher,
 )
-from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info, _noop
+from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info, _noop, _set_reuseport
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
@@ -288,10 +290,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     #: network I/O methods
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
-        raise NotImplementedError
+        return await self.run_in_executor(None, socket.getaddrinfo, host, port, family, type, proto, flags)
 
     async def getnameinfo(self, sockaddr, flags=0):
-        raise NotImplementedError
+        return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
     async def create_connection(
         self,
@@ -331,7 +333,112 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         ssl_shutdown_timeout=None,
         start_serving=True,
     ):
-        raise NotImplementedError
+        # TODO
+        if ssl:
+            raise NotImplementedError
+
+        if isinstance(ssl, bool):
+            raise TypeError('ssl argument must be an SSLContext or None')
+
+        if ssl_handshake_timeout is not None and ssl is None:
+            raise ValueError('ssl_handshake_timeout is only meaningful with ssl')
+
+        if ssl_shutdown_timeout is not None and ssl is None:
+            raise ValueError('ssl_shutdown_timeout is only meaningful with ssl')
+
+        # TODO
+        # if sock is not None:
+        #     _check_ssl_socket(sock)
+
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError('host/port and sock can not be specified at the same time')
+
+            if reuse_address is None:
+                reuse_address = os.name == 'posix' and sys.platform != 'cygwin'
+
+            sockets = []
+            if host == '':
+                hosts = [None]
+            elif isinstance(host, str) or not isinstance(host, (tuple, list)):
+                hosts = [host]
+            else:
+                hosts = host
+
+            fs = [self._create_server_getaddrinfo(host, port, family=family, flags=flags) for host in hosts]
+            infos = await _gather(*fs)
+            infos = set(_iterchain.from_iterable(infos))
+
+            completed = False
+            try:
+                for res in infos:
+                    af, socktype, proto, canonname, sa = res
+                    try:
+                        sock = socket.socket(af, socktype, proto)
+                    except socket.error:
+                        # Assume it's a bad family/type/protocol combination.
+                        continue
+                    sockets.append(sock)
+                    if reuse_address:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+                    if reuse_port:
+                        _set_reuseport(sock)
+                    if keep_alive:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)
+                    # Disable IPv4/IPv6 dual stack support (enabled by
+                    # default on Linux) which makes a single socket
+                    # listen on both address families.
+                    if _HAS_IPv6 and af == socket.AF_INET6 and hasattr(socket, 'IPPROTO_IPV6'):
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, True)
+                    try:
+                        sock.bind(sa)
+                    except OSError as err:
+                        msg = 'error while attempting to bind on address %r: %s' % (sa, str(err).lower())
+                        if err.errno == errno.EADDRNOTAVAIL:
+                            # Assume the family is not enabled (bpo-30945)
+                            sockets.pop()
+                            sock.close()
+                            continue
+                        raise OSError(err.errno, msg) from None
+
+                if not sockets:
+                    raise OSError('could not bind on any address out of %r' % ([info[4] for info in infos],))
+
+                completed = True
+            finally:
+                if not completed:
+                    for sock in sockets:
+                        sock.close()
+        else:
+            if sock is None:
+                raise ValueError('Neither host/port nor sock were specified')
+            if sock.type != socket.SOCK_STREAM:
+                raise ValueError(f'A Stream Socket was expected, got {sock!r}')
+            sockets = [sock]
+
+        rsocks = []
+        for sock in sockets:
+            sock.setblocking(False)
+            rsocks.append((sock.fileno(), sock.family))
+            sock.detach()
+
+        # TODO: ssl
+        # server = self._tcp_server(sockets, rsocks, protocol_factory, backlog,
+        #                 ssl, ssl_handshake_timeout,
+        #                 ssl_shutdown_timeout)
+        server = self._tcp_server(sockets, rsocks, protocol_factory, backlog)
+
+        if start_serving:
+            server._start_serving()
+
+        return server
+
+    async def _create_server_getaddrinfo(self, host, port, family, flags):
+        infos = await self._ensure_resolved((host, port), family=family, type=socket.SOCK_STREAM, flags=flags)
+        if not infos:
+            raise OSError(f'getaddrinfo({host!r}) returned empty list')
+
+        return infos
 
     async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
         raise NotImplementedError
