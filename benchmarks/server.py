@@ -119,9 +119,9 @@ def run(args):
 
         print('using asyncio/streams')
         if unix:
-            coro = asyncio.start_unix_server(echo_client_streams, addr, loop=loop, limit=1024 * 1024)
+            coro = asyncio.start_unix_server(echo_client_streams, addr, limit=1024 * 1024)
         else:
-            coro = asyncio.start_server(echo_client_streams, *addr, loop=loop, limit=1024 * 1024)
+            coro = asyncio.start_server(echo_client_streams, *addr, limit=1024 * 1024)
         loop.run_until_complete(coro)
     elif args.proto:
         if args.streams:
