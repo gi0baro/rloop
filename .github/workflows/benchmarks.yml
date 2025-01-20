@@ -10,11 +10,11 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: '3.13'
     - uses: pyo3/maturin-action@v1
       with:
         command: build
-        args: --release --interpreter python3.12
+        args: --release --interpreter python3.13
         target: x64
         manylinux: auto
         container: off
@@ -24,7 +24,7 @@ jobs:
     - name: benchmark
       working-directory: ./benchmarks
       run: |
-        python benchmarks.py raw
+        python benchmarks.py raw stream proto
     - name: upload results
       uses: actions/upload-artifact@v4
       with:
