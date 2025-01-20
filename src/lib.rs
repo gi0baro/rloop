@@ -10,6 +10,7 @@ mod server;
 mod sock;
 mod tcp;
 mod time;
+mod utils;
 
 pub(crate) fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();

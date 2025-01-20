@@ -248,6 +248,7 @@ version = "0.1.0-alpha4"
 dependencies = [
  "anyhow",
  "dashmap",
+ "libc",
  "mio",
  "pyo3",
  "socket2",
