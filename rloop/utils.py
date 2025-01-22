@@ -1,3 +1,5 @@
+import collections
+import itertools
 import os
 import socket
 
@@ -77,6 +79,23 @@ def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
 
     # "host" is not an IP address.
     return None
+
+
+def _interleave_addrinfos(addrinfos, first_address_family_count=1):
+    addrinfos_by_family = collections.OrderedDict()
+    for addr in addrinfos:
+        family = addr[0]
+        if family not in addrinfos_by_family:
+            addrinfos_by_family[family] = []
+        addrinfos_by_family[family].append(addr)
+    addrinfos_lists = list(addrinfos_by_family.values())
+
+    reordered = []
+    if first_address_family_count > 1:
+        reordered.extend(addrinfos_lists[0][: first_address_family_count - 1])
+        del addrinfos_lists[0][: first_address_family_count - 1]
+    reordered.extend(a for a in itertools.chain.from_iterable(itertools.zip_longest(*addrinfos_lists)) if a is not None)
+    return reordered
 
 
 def _set_reuseport(sock):

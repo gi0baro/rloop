@@ -129,7 +129,7 @@ impl TCPServerRef {
         );
 
         (
-            TCPStream::new(
+            TCPStream::from_listener(
                 self.fd,
                 stream,
                 pytransport.into(),
@@ -143,7 +143,7 @@ impl TCPServerRef {
 }
 
 pub(crate) struct TCPStream {
-    pub lfd: usize,
+    pub lfd: Option<usize>,
     pub io: TcpStream,
     pub pytransport: Arc<Py<PyTCPTransport>>,
     read_buffered: bool,
@@ -153,8 +153,8 @@ pub(crate) struct TCPStream {
 }
 
 impl TCPStream {
-    fn new(
-        lfd: usize,
+    fn from_listener(
+        fd: usize,
         stream: TcpStream,
         pytransport: Arc<Py<PyTCPTransport>>,
         read_buffered: bool,
@@ -162,12 +162,51 @@ impl TCPStream {
         pym_buf_get: PyObject,
     ) -> Self {
         Self {
-            lfd,
+            lfd: Some(fd),
             io: stream,
             pytransport,
             read_buffered,
             write_buffer: VecDeque::new(),
             pym_recv_data,
+            pym_buf_get,
+        }
+    }
+
+    pub(crate) fn from_py(py: Python, pyloop: &Py<EventLoop>, pysock: (i32, i32), proto_factory: PyObject) -> Self {
+        let sock = unsafe { socket2::Socket::from_raw_fd(pysock.0) };
+        _ = sock.set_nonblocking(true);
+        let stdl: std::net::TcpStream = sock.into();
+        let stream = TcpStream::from_std(stdl);
+        // let stream = TcpStream::from_raw_fd(rsock);
+
+        let proto = proto_factory.bind(py).call0().unwrap();
+        let mut buffered_proto = false;
+        let pym_recv_data: PyObject;
+        let pym_buf_get: PyObject;
+        if proto.is_instance(asyncio_proto_buf(py).unwrap()).unwrap() {
+            buffered_proto = true;
+            pym_recv_data = proto.getattr(pyo3::intern!(py, "buffer_updated")).unwrap().unbind();
+            pym_buf_get = proto.getattr(pyo3::intern!(py, "get_buffer")).unwrap().unbind();
+        } else {
+            pym_recv_data = proto.getattr(pyo3::intern!(py, "data_received")).unwrap().unbind();
+            pym_buf_get = py.None();
+        }
+        let pyproto = proto.unbind();
+        let pytransport = PyTCPTransport::new(
+            py,
+            stream.as_raw_fd() as usize,
+            pysock.1,
+            pyloop.clone_ref(py),
+            pyproto.clone_ref(py),
+        );
+
+        Self {
+            lfd: None,
+            io: stream,
+            pytransport: pytransport.into(),
+            read_buffered: buffered_proto,
+            write_buffer: VecDeque::new(),
+            pym_recv_data: pym_recv_data.into(),
             pym_buf_get,
         }
     }
@@ -215,6 +254,14 @@ impl PyTCPTransport {
             },
         )
         .unwrap()
+    }
+
+    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<PyObject> {
+        let rself = pyself.get();
+        rself
+            .proto
+            .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
+        Ok(rself.proto.clone_ref(py))
     }
 
     #[inline]
