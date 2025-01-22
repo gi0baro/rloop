@@ -175,19 +175,17 @@ impl TCPStream {
 }
 
 impl TCPStream {
-    pub(crate) fn recv(&mut self, event: &Event, fd: usize) -> HandleRef {
-        // TODO: set eof in transport?
+    pub(crate) fn recv(&mut self, event: &Event, fd: usize, buf: &mut [u8]) -> Option<HandleRef> {
         if event.is_read_closed() {
-            Arc::new(TCPHandleRecvEof {
+            return Some(Arc::new(TCPHandleRecvEof {
                 transport: self.pytransport.clone(),
                 fd,
                 send_buf_empty: self.write_buffer.is_empty(),
-            })
-        } else {
-            match self.read_buffered {
-                true => self.recv_buffered(fd),
-                false => self.recv_direct(fd),
-            }
+            }));
+        }
+        match self.read_buffered {
+            true => self.recv_buffered(fd),
+            false => self.recv_direct(fd, buf),
         }
     }
 
@@ -220,23 +218,27 @@ impl TCPStream {
     }
 
     #[inline]
-    fn recv_direct(&mut self, fd: usize) -> HandleRef {
-        let data = self.read();
-        if data.is_empty() {
-            return Arc::new(TCPHandleRecvEof {
+    fn recv_direct(&mut self, fd: usize, buf: &mut [u8]) -> Option<HandleRef> {
+        let len = self.read_into(buf);
+        if len == 0 {
+            return Some(Arc::new(TCPHandleRecvEof {
                 transport: self.pytransport.clone(),
                 fd,
                 send_buf_empty: self.write_buffer.is_empty(),
-            });
+            }));
         }
-        Arc::new(TCPHandleRecv {
-            cb: self.pym_recv_data.clone(),
-            data,
-        })
+
+        let rbuf = &buf[..len];
+        Python::with_gil(|py| {
+            let pydata = unsafe { PyBytes::from_ptr(py, rbuf.as_ptr(), len) };
+            _ = self.pym_recv_data.call1(py, (pydata,));
+        });
+
+        None
     }
 
     #[inline]
-    fn recv_buffered(&mut self, fd: usize) -> HandleRef {
+    fn recv_buffered(&mut self, fd: usize) -> Option<HandleRef> {
         // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
         //       which is smth we can't really use to read from `TcpStream`.
         //       So even if this sucks, we copy data back and forth, at least until
@@ -250,36 +252,38 @@ impl TCPStream {
 
         let read = self.read_into(vbuf.as_mut_slice());
         if read == 0 {
-            return Arc::new(TCPHandleRecvEof {
+            return Some(Arc::new(TCPHandleRecvEof {
                 transport: self.pytransport.clone(),
                 fd,
                 send_buf_empty: self.write_buffer.is_empty(),
-            });
+            }));
         }
-        _ = Python::with_gil(|py| pybuf.copy_from_slice(py, &vbuf[..]));
-        Arc::new(TCPHandleRecvBuf {
-            cb: self.pym_recv_data.clone(),
-            data: read,
-        })
+
+        Python::with_gil(|py| {
+            _ = pybuf.copy_from_slice(py, &vbuf[..]);
+            _ = self.pym_recv_data.call1(py, (read,));
+        });
+
+        None
     }
 
-    #[inline]
-    fn read(&mut self) -> Box<[u8]> {
-        let mut len = 0;
-        let mut buf = [0; 262_144];
-        loop {
-            match self.io.read(&mut buf[len..]) {
-                Ok(readn) if readn != 0 => {
-                    len += readn;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                _ => break,
-            }
-        }
-        buf[..len].into()
-    }
+    // #[inline]
+    // fn read(&mut self) -> Box<[u8]> {
+    //     let mut len = 0;
+    //     let mut buf = [0; 262_144];
+    //     loop {
+    //         match self.io.read(&mut buf[len..]) {
+    //             Ok(readn) if readn != 0 => {
+    //                 len += readn;
+    //             }
+    //             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+    //             _ => break,
+    //         }
+    //     }
+    //     buf[..len].into()
+    // }
 
-    #[inline]
+    #[inline(always)]
     fn read_into(&mut self, buf: &mut [u8]) -> usize {
         let mut len = 0;
         loop {
@@ -675,35 +679,6 @@ impl PyTCPTransport {
             self.pyloop.get().tcp_stream_rem(self.fd, Interest::READABLE);
         }
         self.call_conn_lost(py, None);
-    }
-}
-
-// impl Drop for PyTCPTransport {
-//     fn drop(&mut self) {
-//         println!("PyTCPTransport drop");
-//     }
-// }
-
-struct TCPHandleRecv {
-    cb: Arc<PyObject>,
-    data: Box<[u8]>,
-}
-
-impl Handle for TCPHandleRecv {
-    fn run(self: Arc<Self>, py: Python, _event_loop: &EventLoop) {
-        let pydata = unsafe { PyBytes::from_ptr(py, self.data.as_ptr(), self.data.len()) };
-        _ = self.cb.call1(py, (pydata,));
-    }
-}
-
-struct TCPHandleRecvBuf {
-    cb: Arc<PyObject>,
-    data: usize,
-}
-
-impl Handle for TCPHandleRecvBuf {
-    fn run(self: Arc<Self>, py: Python, _event_loop: &EventLoop) {
-        _ = self.cb.call1(py, (self.data,));
     }
 }
 

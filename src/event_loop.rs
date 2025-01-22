@@ -46,6 +46,12 @@ struct TCPStreamHandleData {
     interest: Interest,
 }
 
+struct EventLoopRunState {
+    events: event::Events,
+    read_buf: Box<[u8]>,
+    tick_last: u128,
+}
+
 #[pyclass(frozen, subclass)]
 pub struct EventLoop {
     idle: atomic::AtomicBool,
@@ -56,7 +62,6 @@ pub struct EventLoop {
     epoch: Instant,
     counter_ready: atomic::AtomicUsize,
     ssock: Arc<RwLock<Option<(socket2::Socket, socket2::Socket)>>>,
-    tick_last_poll: atomic::AtomicU64,
     closed: atomic::AtomicBool,
     exc_handler: Arc<RwLock<PyObject>>,
     exception_handler: Arc<RwLock<PyObject>>,
@@ -85,9 +90,8 @@ pub struct EventLoop {
 
 impl EventLoop {
     #[inline]
-    fn step(&self, py: Python) -> std::result::Result<(), std::io::Error> {
+    fn step(&self, py: Python, state: &mut EventLoopRunState) -> std::result::Result<(), std::io::Error> {
         let (poll_result, mut cb_handles) = py.allow_threads(|| {
-            let mut io_events = event::Events::with_capacity(128);
             let mut sched_time: Option<u64> = None;
             let mut skip_poll = false;
 
@@ -96,8 +100,8 @@ impl EventLoop {
                 sched_time = Some(0);
                 // we want to skip polling when unnecessary:
                 // if work is ready we check the time since last poll and skip for max 250μs
-                let tick = Instant::now().duration_since(self.epoch).as_micros() as u64;
-                if (tick - self.tick_last_poll.load(atomic::Ordering::Relaxed)) < 250 {
+                let tick = Instant::now().duration_since(self.epoch).as_micros();
+                if (tick - state.tick_last) < 250 {
                     skip_poll = true;
                 }
             } else {
@@ -120,18 +124,15 @@ impl EventLoop {
                     if sched_time.is_none() {
                         self.idle.store(true, atomic::Ordering::Release);
                     }
-                    let res = io.poll(&mut io_events, sched_time.map(Duration::from_millis));
+                    let res = io.poll(&mut state.events, sched_time.map(Duration::from_millis));
                     if let Err(ref err) = res {
                         if err.kind() == std::io::ErrorKind::Interrupted {
                             // if we got an interrupt, we retry ready events (as we might need to process signals)
-                            let _ = io.poll(&mut io_events, Some(Duration::from_millis(0)));
+                            let _ = io.poll(&mut state.events, Some(Duration::from_millis(0)));
                         }
                     }
                     self.idle.store(false, atomic::Ordering::Release);
-                    self.tick_last_poll.store(
-                        Instant::now().duration_since(self.epoch).as_micros() as u64,
-                        atomic::Ordering::Release,
-                    );
+                    state.tick_last = Instant::now().duration_since(self.epoch).as_micros();
                     res
                 }
             };
@@ -143,13 +144,13 @@ impl EventLoop {
             self.counter_ready
                 .fetch_sub(cb_handles.len(), atomic::Ordering::Release);
 
-            for event in &io_events {
+            for event in &state.events {
                 // NOTE: cancellation is not necessary as we have custom futures
                 if let Some(io_handle) = self.handles_io.get(&event.token()) {
                     match io_handle.value() {
                         Handle::Py(handle) => self.handle_io_py(event, handle, &mut cb_handles),
                         Handle::TCPListener(handle) => self.handle_io_tcpl(handle, &mut cb_handles),
-                        Handle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
+                        Handle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles, &mut state.read_buf),
                         Handle::Internal(_) => self.handle_io_internal(&mut cb_handles),
                     }
                 }
@@ -235,14 +236,15 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>) {
+    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>, read_buf: &mut [u8]) {
         let fd = event.token().0;
-        // println!("handle_io_tcps {:?}", fd);
         let mut stream_ref = self.tcp_streams.get_mut(&fd).unwrap();
         let io = stream_ref.value_mut();
 
         if event.is_readable() {
-            handles_ready.push_back(io.recv(event, fd));
+            if let Some(handle) = io.recv(event, fd, read_buf) {
+                handles_ready.push_back(handle);
+            }
         } else if event.is_writable() {
             handles_ready.push_back(io.send(event, fd));
         }
@@ -529,13 +531,10 @@ impl EventLoop {
             io: Arc::new(Mutex::new(Poll::new()?)),
             handles_io: Arc::new(DashMap::with_capacity(128)),
             handles_ready: Arc::new(Mutex::new(VecDeque::with_capacity(128))),
-            // handles_ready2: Arc::new(Mutex::new(VecDeque::with_capacity(128))),
             handles_sched: Arc::new(Mutex::new(BinaryHeap::with_capacity(32))),
             epoch: Instant::now(),
             counter_ready: atomic::AtomicUsize::new(0),
-            // counter_io: atomic::AtomicU16::new(0),
             ssock: Arc::new(RwLock::new(None)),
-            tick_last_poll: atomic::AtomicU64::new(0),
             closed: atomic::AtomicBool::new(false),
             exc_handler: Arc::new(RwLock::new(py.None())),
             exception_handler: Arc::new(RwLock::new(py.None())),
@@ -1002,12 +1001,18 @@ impl EventLoop {
     }
 
     fn _run(&self, py: Python) -> PyResult<()> {
+        let mut state = EventLoopRunState {
+            events: event::Events::with_capacity(128),
+            read_buf: [0; 262_144].into(),
+            tick_last: 0,
+        };
+
         loop {
             if self.stopping.load(atomic::Ordering::Acquire) {
                 break;
             }
             // let t = Instant::now();
-            if let Err(err) = self.step(py) {
+            if let Err(err) = self.step(py, &mut state) {
                 if err.kind() == std::io::ErrorKind::Interrupted
                     && self.sig_loop_handled.swap(false, atomic::Ordering::Release)
                 {
