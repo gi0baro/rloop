@@ -10,6 +10,7 @@ import warnings
 from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_future as _wrap_future
+from asyncio.staggered import staggered_race as _staggered_race
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context as _copy_context
@@ -27,7 +28,7 @@ from .subprocess import (
     _SubProcessTransport,
     _ThreadedChildWatcher,
 )
-from .utils import _can_use_pidfd, _HAS_IPv6, _ipaddr_info, _noop, _set_reuseport
+from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_info, _noop, _set_reuseport
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
@@ -312,8 +313,164 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         ssl_shutdown_timeout=None,
         happy_eyeballs_delay=None,
         interleave=None,
+        all_errors=False,
     ):
-        raise NotImplementedError
+        # TODO
+        if ssl:
+            raise NotImplementedError
+
+        if server_hostname is not None and not ssl:
+            raise ValueError('server_hostname is only meaningful with ssl')
+
+        if server_hostname is None and ssl:
+            if not host:
+                raise ValueError('You must set server_hostname when using ssl without a host')
+            server_hostname = host
+
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError('ssl_handshake_timeout is only meaningful with ssl')
+
+        if ssl_shutdown_timeout is not None and not ssl:
+            raise ValueError('ssl_shutdown_timeout is only meaningful with ssl')
+
+        # TODO
+        # if sock is not None:
+        #     _check_ssl_socket(sock)
+
+        if happy_eyeballs_delay is not None and interleave is None:
+            # If using happy eyeballs, default to interleave addresses by family
+            interleave = 1
+
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError('host/port and sock can not be specified at the same time')
+
+            infos = await self._ensure_resolved(
+                (host, port), family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags, loop=self
+            )
+            if not infos:
+                raise OSError('getaddrinfo() returned empty list')
+
+            if local_addr is not None:
+                laddr_infos = await self._ensure_resolved(
+                    local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags, loop=self
+                )
+                if not laddr_infos:
+                    raise OSError('getaddrinfo() returned empty list')
+            else:
+                laddr_infos = None
+
+            if interleave:
+                infos = _interleave_addrinfos(infos, interleave)
+
+            exceptions = []
+            if happy_eyeballs_delay is None:
+                # not using happy eyeballs
+                for addrinfo in infos:
+                    try:
+                        sock = await self._connect_sock(exceptions, addrinfo, laddr_infos)
+                        break
+                    except OSError:
+                        continue
+            else:  # using happy eyeballs
+                sock = (
+                    await _staggered_race(
+                        (
+                            # can't use functools.partial as it keeps a reference
+                            # to exceptions
+                            lambda addrinfo=addrinfo: self._connect_sock(exceptions, addrinfo, laddr_infos)
+                            for addrinfo in infos
+                        ),
+                        happy_eyeballs_delay,
+                        loop=self,
+                    )
+                )[0]  # can't use sock, _, _ as it keeks a reference to exceptions
+
+            if sock is None:
+                exceptions = [exc for sub in exceptions for exc in sub]
+                try:
+                    if all_errors:
+                        raise ExceptionGroup('create_connection failed', exceptions)
+                    if len(exceptions) == 1:
+                        raise exceptions[0]
+                    else:
+                        # If they all have the same str(), raise one.
+                        model = str(exceptions[0])
+                        if all(str(exc) == model for exc in exceptions):
+                            raise exceptions[0]
+                        # Raise a combined exception so the user can see all
+                        # the various error messages.
+                        raise OSError('Multiple exceptions: {}'.format(', '.join(str(exc) for exc in exceptions)))
+                finally:
+                    exceptions = None
+
+        else:
+            if sock is None:
+                raise ValueError('host and port was not specified and no sock specified')
+            if sock.type != socket.SOCK_STREAM:
+                # We allow AF_INET, AF_INET6, AF_UNIX as long as they
+                # are SOCK_STREAM.
+                # We support passing AF_UNIX sockets even though we have
+                # a dedicated API for that: create_unix_connection.
+                # Disallowing AF_UNIX in this method, breaks backwards
+                # compatibility.
+                raise ValueError(f'A Stream Socket was expected, got {sock!r}')
+
+        sock.setblocking(False)
+        rsock = (sock.fileno(), sock.family)
+        sock.detach()
+
+        # TODO: ssl
+        transport, protocol = self._tcp_conn(rsock, protocol_factory)
+        # transport, protocol = await self._create_connection_transport(
+        #     sock,
+        #     protocol_factory,
+        #     ssl,
+        #     server_hostname,
+        #     ssl_handshake_timeout=ssl_handshake_timeout,
+        #     ssl_shutdown_timeout=ssl_shutdown_timeout,
+        # )
+
+        return transport, protocol
+
+    async def _connect_sock(self, exceptions, addr_info, local_addr_infos=None):
+        my_exceptions = []
+        exceptions.append(my_exceptions)
+        family, type_, proto, _, address = addr_info
+        sock = None
+        try:
+            sock = socket.socket(family=family, type=type_, proto=proto)
+            sock.setblocking(False)
+            if local_addr_infos is not None:
+                for lfamily, _, _, _, laddr in local_addr_infos:
+                    # skip local addresses of different family
+                    if lfamily != family:
+                        continue
+                    try:
+                        sock.bind(laddr)
+                        break
+                    except OSError as exc:
+                        msg = f'error while attempting to bind on address {laddr!r}: {str(exc).lower()}'
+                        exc = OSError(exc.errno, msg)
+                        my_exceptions.append(exc)
+                else:  # all bind attempts failed
+                    if my_exceptions:
+                        raise my_exceptions.pop()
+                    else:
+                        raise OSError(f'no matching local address with {family=} found')
+            await self.sock_connect(sock, address)
+            return sock
+        except OSError as exc:
+            my_exceptions.append(exc)
+            if sock is not None:
+                sock.close()
+            raise
+        except:
+            if sock is not None:
+                sock.close()
+            raise
+        finally:
+            exceptions = my_exceptions = None
 
     async def create_server(
         self,

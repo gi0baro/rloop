@@ -18,7 +18,7 @@ use crate::{
     log::{log_exc_to_py_ctx, LogExc},
     py::{copy_context, weakset},
     server::Server,
-    tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPStream, TCPWriteHandle},
+    tcp::{PyTCPTransport, TCPReadHandle, TCPServer, TCPServerRef, TCPStream, TCPWriteHandle},
     time::Timer,
 };
 
@@ -413,10 +413,12 @@ impl EventLoop {
     pub(crate) fn tcp_stream_close(&self, fd: usize) {
         // println!("tcp_stream_close {:?}", fd);
         if let Some((_, stream)) = self.tcp_streams.remove(&fd) {
-            self.tcp_lstreams.alter(&stream.lfd, |_, mut v| {
-                v.remove(&fd);
-                v
-            });
+            if let Some(lfd) = &stream.lfd {
+                self.tcp_lstreams.alter(lfd, |_, mut v| {
+                    v.remove(&fd);
+                    v
+                });
+            }
         }
     }
 
@@ -988,6 +990,22 @@ impl EventLoop {
         })
     }
 
+    fn _tcp_conn(
+        pyself: Py<Self>,
+        py: Python,
+        sock: (i32, i32),
+        protocol_factory: PyObject,
+    ) -> PyResult<(Py<PyTCPTransport>, PyObject)> {
+        let rself = pyself.get();
+        let stream = TCPStream::from_py(py, &pyself, sock, protocol_factory);
+        let transport = stream.pytransport.clone_ref(py);
+        let fd = transport.get().fd;
+        let proto = PyTCPTransport::attach(&transport, py)?;
+        rself.tcp_streams.insert(fd, stream);
+        rself.tcp_stream_add(fd, Interest::READABLE);
+        Ok((transport, proto))
+    }
+
     fn _tcp_server(
         pyself: Py<Self>,
         py: Python,
@@ -1020,6 +1038,7 @@ impl EventLoop {
     fn _run(&self, py: Python) -> PyResult<()> {
         let mut state = EventLoopRunState {
             events: event::Events::with_capacity(128),
+            #[allow(clippy::large_stack_arrays)]
             read_buf: [0; 262_144].into(),
             tick_last: 0,
         };
