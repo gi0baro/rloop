@@ -135,7 +135,7 @@ impl Handle for CBHandleOneArg {
     }
 }
 
-#[pyclass(frozen, name = "CBHandle")]
+#[pyclass(frozen, name = "CBHandle", module = "rloop._rloop")]
 pub(crate) struct PyHandle {
     pub handle: HandleRef,
 }
@@ -151,7 +151,7 @@ impl PyHandle {
     }
 }
 
-#[pyclass(frozen, name = "TimerHandle")]
+#[pyclass(frozen, name = "TimerHandle", module = "rloop._rloop")]
 pub(crate) struct PyTimerHandle {
     pub handle: HandleRef,
     #[pyo3(get)]

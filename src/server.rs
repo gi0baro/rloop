@@ -10,7 +10,7 @@ enum ServerType {
     // Unix,
 }
 
-#[pyclass(frozen, subclass)]
+#[pyclass(frozen, subclass, module = "granian._granian")]
 pub(crate) struct Server {
     #[pyo3(get)]
     _loop: Py<EventLoop>,

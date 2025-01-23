@@ -212,7 +212,7 @@ impl TCPStream {
     }
 }
 
-#[pyclass(frozen)]
+#[pyclass(frozen, name = "TCPTransport", module = "granian._granian")]
 pub(crate) struct PyTCPTransport {
     pub fd: usize,
     extra: HashMap<String, PyObject>,

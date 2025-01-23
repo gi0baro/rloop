@@ -52,7 +52,7 @@ pub(crate) struct EventLoopRunState {
     tick_last: u128,
 }
 
-#[pyclass(frozen, subclass)]
+#[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct EventLoop {
     idle: atomic::AtomicBool,
     io: Arc<Mutex<Poll>>,
