@@ -3,11 +3,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 
 use anyhow::Result;
 use mio::{
-    event::Event,
     net::{TcpListener, TcpStream},
     Interest,
 };
-use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes};
+use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -16,7 +15,7 @@ use std::{
 };
 
 use crate::{
-    event_loop::EventLoop,
+    event_loop::{EventLoop, EventLoopRunState},
     handles::{CBHandle, Handle, HandleRef},
     log::LogExc,
     py::{asyncio_proto_buf, copy_context},
@@ -174,155 +173,6 @@ impl TCPStream {
     }
 }
 
-impl TCPStream {
-    pub(crate) fn recv(&mut self, event: &Event, fd: usize, buf: &mut [u8]) -> Option<HandleRef> {
-        if event.is_read_closed() {
-            return Some(Arc::new(TCPHandleRecvEof {
-                transport: self.pytransport.clone(),
-                fd,
-                send_buf_empty: self.write_buffer.is_empty(),
-            }));
-        }
-        match self.read_buffered {
-            true => self.recv_buffered(fd),
-            false => self.recv_direct(fd, buf),
-        }
-    }
-
-    pub(crate) fn send(&mut self, event: &Event, fd: usize) -> HandleRef {
-        // println!("tcp stream send {:?}", transport.fd);
-        if event.is_write_closed() {
-            self.write_buffer.clear();
-            Arc::new(TCPHandleSend {
-                transport: self.pytransport.clone(),
-                fd,
-                written: Some(0),
-                send_buf_empty: true,
-            })
-        } else {
-            match self.write() {
-                Some(written) => Arc::new(TCPHandleSend {
-                    transport: self.pytransport.clone(),
-                    fd,
-                    written: Some(written),
-                    send_buf_empty: self.write_buffer.is_empty(),
-                }),
-                _ => Arc::new(TCPHandleSend {
-                    transport: self.pytransport.clone(),
-                    fd,
-                    written: None,
-                    send_buf_empty: true,
-                }),
-            }
-        }
-    }
-
-    #[inline]
-    fn recv_direct(&mut self, fd: usize, buf: &mut [u8]) -> Option<HandleRef> {
-        let len = self.read_into(buf);
-        if len == 0 {
-            return Some(Arc::new(TCPHandleRecvEof {
-                transport: self.pytransport.clone(),
-                fd,
-                send_buf_empty: self.write_buffer.is_empty(),
-            }));
-        }
-
-        let rbuf = &buf[..len];
-        Python::with_gil(|py| {
-            let pydata = unsafe { PyBytes::from_ptr(py, rbuf.as_ptr(), len) };
-            _ = self.pym_recv_data.call1(py, (pydata,));
-        });
-
-        None
-    }
-
-    #[inline]
-    fn recv_buffered(&mut self, fd: usize) -> Option<HandleRef> {
-        // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
-        //       which is smth we can't really use to read from `TcpStream`.
-        //       So even if this sucks, we copy data back and forth, at least until
-        //       we figure out a way to actually use `PyBuffer` directly.
-        // let (mut eofr, mut eofw) = (false, false);
-        let (pybuf, mut vbuf) = Python::with_gil(|py| {
-            let pybuf: PyBuffer<u8> = PyBuffer::get(&self.pym_buf_get.bind(py).call1((-1,)).unwrap()).unwrap();
-            let vbuf = pybuf.to_vec(py).unwrap();
-            (pybuf, vbuf)
-        });
-
-        let read = self.read_into(vbuf.as_mut_slice());
-        if read == 0 {
-            return Some(Arc::new(TCPHandleRecvEof {
-                transport: self.pytransport.clone(),
-                fd,
-                send_buf_empty: self.write_buffer.is_empty(),
-            }));
-        }
-
-        Python::with_gil(|py| {
-            _ = pybuf.copy_from_slice(py, &vbuf[..]);
-            _ = self.pym_recv_data.call1(py, (read,));
-        });
-
-        None
-    }
-
-    // #[inline]
-    // fn read(&mut self) -> Box<[u8]> {
-    //     let mut len = 0;
-    //     let mut buf = [0; 262_144];
-    //     loop {
-    //         match self.io.read(&mut buf[len..]) {
-    //             Ok(readn) if readn != 0 => {
-    //                 len += readn;
-    //             }
-    //             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-    //             _ => break,
-    //         }
-    //     }
-    //     buf[..len].into()
-    // }
-
-    #[inline(always)]
-    fn read_into(&mut self, buf: &mut [u8]) -> usize {
-        let mut len = 0;
-        loop {
-            match self.io.read(&mut buf[len..]) {
-                Ok(readn) if readn != 0 => {
-                    len += readn;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                _ => break,
-            }
-        }
-        len
-    }
-
-    #[inline]
-    fn write(&mut self) -> Option<usize> {
-        let mut ret = 0;
-        while let Some(data) = self.write_buffer.pop_front() {
-            match self.io.write(&data) {
-                Ok(written) if written != data.len() => {
-                    self.write_buffer.push_front((&data[written..]).into());
-                    ret += written;
-                    break;
-                }
-                Ok(written) => ret += written,
-                Err(err) if err.kind() != std::io::ErrorKind::Interrupted => {
-                    self.write_buffer.clear();
-                    return None;
-                }
-                _ => {
-                    self.write_buffer.push_front(data);
-                    break;
-                }
-            }
-        }
-        Some(ret)
-    }
-}
-
 #[pyclass(frozen)]
 pub(crate) struct PyTCPTransport {
     pub fd: usize,
@@ -383,25 +233,46 @@ impl PyTCPTransport {
     }
 
     #[inline]
-    fn write_buf_eof(&self, py: Python, errored: bool) -> bool {
-        if self.closing.load(atomic::Ordering::Relaxed) {
-            self.call_conn_lost(
-                py,
-                errored.then(|| pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")),
-            );
+    fn close_from_read_handle(&self, py: Python, event_loop: &EventLoop) -> bool {
+        if self
+            .closing
+            .compare_exchange(false, true, atomic::Ordering::Release, atomic::Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
-        self.weof.load(atomic::Ordering::Relaxed)
+
+        event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+        _ = self.pym_conn_lost.call1(py, (py.None(),));
+        true
     }
 
     #[inline]
+    fn close_from_write_handle(&self, py: Python, errored: bool) -> Option<bool> {
+        if self.closing.load(atomic::Ordering::Relaxed) {
+            _ = self.pym_conn_lost.call1(
+                py,
+                (errored
+                    .then(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")
+                            .into_py_any(py)
+                            .unwrap()
+                    })
+                    .unwrap_or_else(|| py.None()),),
+            );
+            return Some(true);
+        }
+        self.weof.load(atomic::Ordering::Relaxed).then_some(false)
+    }
+
+    #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
         _ = self.pym_conn_lost.call1(py, (err,));
         self.pyloop.get().tcp_stream_close(self.fd);
     }
 
     fn try_write(pyself: &Py<Self>, py: Python, data: &[u8]) -> PyResult<()> {
-        // println!("tcp try_write");
+        // println!("tcp try_write {:?}", data.len());
 
         let rself = pyself.get();
         if rself.weof.load(atomic::Ordering::Relaxed) {
@@ -421,31 +292,37 @@ impl PyTCPTransport {
         match py.allow_threads(|| match rself.write_buf_size.load(atomic::Ordering::Relaxed) {
             #[allow(clippy::cast_possible_wrap)]
             0 => match crate::utils::syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
-                Ok(written) if written as usize == data.len() => Ok(0),
+                Ok(written) if written as usize == data.len() => Ok::<usize, anyhow::Error>(0),
                 Ok(written) => {
                     let written = written as usize;
-                    rself.pyloop.get().with_tcp_stream(rself.fd, |stream| {
+                    rself.pyloop.get().try_with_tcp_stream(rself.fd, |stream| {
                         stream.write_buffer.push_back((&data[written..]).into());
-                    });
+                        Ok(())
+                    })?;
                     Ok(data.len() - written)
                 }
                 Err(err)
                     if err.kind() == std::io::ErrorKind::Interrupted
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    rself.pyloop.get().with_tcp_stream(rself.fd, |stream| {
+                    rself.pyloop.get().try_with_tcp_stream(rself.fd, |stream| {
                         stream.write_buffer.push_back(data.into());
-                    });
+                        Ok(())
+                    })?;
                     Ok(data.len())
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(err.into()),
             },
-            _ => rself.pyloop.get().with_tcp_stream(rself.fd, |stream| {
-                stream.write_buffer.push_back(data.into());
+            _ => {
+                rself.pyloop.get().try_with_tcp_stream(rself.fd, |stream| {
+                    stream.write_buffer.push_back(data.into());
+                    Ok(())
+                })?;
                 Ok(data.len())
-            }),
+            }
         }) {
             Ok(buf_added) if buf_added > 0 => {
+                // println!("try_write add buf {:?}", buf_added);
                 let buf_size = rself.write_buf_size.fetch_add(buf_added, atomic::Ordering::Release) + buf_added;
                 if buf_size > rself.water_hi.load(atomic::Ordering::Relaxed)
                     && rself
@@ -457,6 +334,7 @@ impl PyTCPTransport {
                 }
             }
             Err(err) => {
+                // println!("try_write err {:?}", err);
                 if rself.write_buf_size.load(atomic::Ordering::Relaxed) > 0 {
                     rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::WRITABLE);
                 }
@@ -469,7 +347,9 @@ impl PyTCPTransport {
                 }
                 rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
             }
-            _ => {}
+            _ => {
+                // println!("try_write OK");
+            }
         }
 
         Ok(())
@@ -682,46 +562,160 @@ impl PyTCPTransport {
     }
 }
 
-struct TCPHandleRecvEof {
-    transport: Arc<Py<PyTCPTransport>>,
-    fd: usize,
-    send_buf_empty: bool,
+pub(crate) struct TCPReadHandle {
+    pub fd: usize,
+    pub closed: bool,
 }
 
-impl Handle for TCPHandleRecvEof {
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop) {
-        // println!("TCPHandleRecvEof {:?}", self.fd);
+impl TCPReadHandle {
+    #[inline]
+    fn recv_direct(&self, py: Python, event_loop: &EventLoop, stream: &mut TCPStream, buf: &mut [u8]) -> bool {
+        let len = self.read_into(py, &mut stream.io, buf);
+        // println!("recv_direct {:?}", len);
+        if len == 0 {
+            return self.recv_eof(py, event_loop, stream);
+        }
+
+        let rbuf = &buf[..len];
+        let pydata = unsafe { PyBytes::from_ptr(py, rbuf.as_ptr(), len) };
+        _ = stream.pym_recv_data.call1(py, (pydata,));
+
+        false
+    }
+
+    #[inline]
+    fn recv_buffered(&self, py: Python, event_loop: &EventLoop, stream: &mut TCPStream) -> bool {
+        // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
+        //       which is smth we can't really use to read from `TcpStream`.
+        //       So even if this sucks, we copy data back and forth, at least until
+        //       we figure out a way to actually use `PyBuffer` directly.
+        let pybuf: PyBuffer<u8> = PyBuffer::get(&stream.pym_buf_get.bind(py).call1((-1,)).unwrap()).unwrap();
+        let mut vbuf = pybuf.to_vec(py).unwrap();
+
+        let read = self.read_into(py, &mut stream.io, vbuf.as_mut_slice());
+        if read == 0 {
+            return self.recv_eof(py, event_loop, stream);
+        }
+
+        _ = pybuf.copy_from_slice(py, &vbuf[..]);
+        _ = stream.pym_recv_data.call1(py, (read,));
+
+        false
+    }
+
+    #[inline(always)]
+    fn read_into(&self, py: Python, stream: &mut TcpStream, buf: &mut [u8]) -> usize {
+        // TODO: handle errors, keep open on WouldBlock
+        let mut len = 0;
+        py.allow_threads(|| {
+            loop {
+                match stream.read(&mut buf[len..]) {
+                    Ok(readn) if readn != 0 => {
+                        len += readn;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // Err(err) => {
+                    //     println!("read_into ERR {:?}", err);
+                    //     break
+                    // }
+                    _ => break,
+                }
+            }
+        });
+        len
+    }
+
+    #[inline]
+    fn recv_eof(&self, py: Python, event_loop: &EventLoop, stream: &mut TCPStream) -> bool {
         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-        let transport = self.transport.get();
+
+        let transport = stream.pytransport.get();
         if let Ok(pyr) = transport.proto.call_method0(py, pyo3::intern!(py, "eof_received")) {
             // println!("recv_eof res {:?}", pyr);
             if let Ok(false) = pyr.is_truthy(py) {
-                if !self.send_buf_empty {
-                    return;
+                if !stream.write_buffer.is_empty() {
+                    return false;
                 }
             }
         }
-        // println!("TCPHandleRecvEof {:?} dropw", self.fd);
-        transport.close(py);
+        transport.close_from_read_handle(py, event_loop)
     }
 }
 
-struct TCPHandleSend {
-    transport: Arc<Py<PyTCPTransport>>,
-    fd: usize,
-    written: Option<usize>,
-    send_buf_empty: bool,
+impl Handle for TCPReadHandle {
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
+        // println!("TCPReadHandle {:?}", self.closed);
+        if event_loop.with_tcp_stream(self.fd, |stream| match self.closed {
+            true => self.recv_eof(py, event_loop, stream),
+            false => match stream.read_buffered {
+                true => self.recv_buffered(py, event_loop, stream),
+                false => self.recv_direct(py, event_loop, stream, &mut state.read_buf),
+            },
+        }) {
+            // println!("TCPReadHandle close");
+            event_loop.tcp_stream_close(self.fd);
+        }
+        // println!("TCPReadHandle done");
+    }
 }
 
-impl Handle for TCPHandleSend {
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop) {
-        if self.send_buf_empty {
+pub(crate) struct TCPWriteHandle {
+    pub fd: usize,
+    pub closed: bool,
+}
+
+impl TCPWriteHandle {
+    #[inline]
+    fn write(&self, py: Python, stream: &mut TCPStream) -> Option<usize> {
+        let mut ret = 0;
+        py.allow_threads(|| {
+            while let Some(data) = stream.write_buffer.pop_front() {
+                match stream.io.write(&data) {
+                    Ok(written) if written != data.len() => {
+                        stream.write_buffer.push_front((&data[written..]).into());
+                        ret += written;
+                        break;
+                    }
+                    Ok(written) => ret += written,
+                    Err(err) if err.kind() != std::io::ErrorKind::Interrupted => {
+                        stream.write_buffer.clear();
+                        return None;
+                    }
+                    _ => {
+                        stream.write_buffer.push_front(data);
+                        break;
+                    }
+                }
+            }
+            Some(ret)
+        })
+    }
+}
+
+impl Handle for TCPWriteHandle {
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        // println!("in TCPWriteHandle");
+
+        if let Some(close) = event_loop.with_tcp_stream(self.fd, |stream| {
+            if self.closed {
+                stream.write_buffer.clear();
+                return stream.pytransport.get().close_from_write_handle(py, false);
+            }
+            if let Some(written) = self.write(py, stream) {
+                PyTCPTransport::write_buf_size_decr(&stream.pytransport, py, written);
+                if stream.write_buffer.is_empty() {
+                    return stream.pytransport.get().close_from_write_handle(py, false);
+                }
+                return None;
+            }
+            stream.pytransport.get().close_from_write_handle(py, true)
+        }) {
             event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-            if self.transport.get().write_buf_eof(py, self.written.is_none()) {
+            if close {
+                event_loop.tcp_stream_close(self.fd);
+            } else {
                 event_loop.tcp_stream_shutdown(self.fd);
             }
-            return;
         }
-        PyTCPTransport::write_buf_size_decr(&self.transport, py, self.written.unwrap());
     }
 }

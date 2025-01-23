@@ -18,7 +18,7 @@ use crate::{
     log::{log_exc_to_py_ctx, LogExc},
     py::{copy_context, weakset},
     server::Server,
-    tcp::{TCPServer, TCPServerRef, TCPStream},
+    tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPStream, TCPWriteHandle},
     time::Timer,
 };
 
@@ -46,9 +46,9 @@ struct TCPStreamHandleData {
     interest: Interest,
 }
 
-struct EventLoopRunState {
+pub(crate) struct EventLoopRunState {
     events: event::Events,
-    read_buf: Box<[u8]>,
+    pub read_buf: Box<[u8]>,
     tick_last: u128,
 }
 
@@ -101,6 +101,7 @@ impl EventLoop {
                 // we want to skip polling when unnecessary:
                 // if work is ready we check the time since last poll and skip for max 250μs
                 let tick = Instant::now().duration_since(self.epoch).as_micros();
+                // println!("tick dt {:?}", tick - state.tick_last);
                 if (tick - state.tick_last) < 250 {
                     skip_poll = true;
                 }
@@ -118,7 +119,10 @@ impl EventLoop {
 
             // I/O
             let poll_result = match skip_poll {
-                true => Ok(()),
+                true => {
+                    state.events.clear();
+                    Ok(())
+                }
                 false => {
                     let mut io = self.io.lock().unwrap();
                     if sched_time.is_none() {
@@ -150,7 +154,7 @@ impl EventLoop {
                     match io_handle.value() {
                         Handle::Py(handle) => self.handle_io_py(event, handle, &mut cb_handles),
                         Handle::TCPListener(handle) => self.handle_io_tcpl(handle, &mut cb_handles),
-                        Handle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles, &mut state.read_buf),
+                        Handle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
                         Handle::Internal(_) => self.handle_io_internal(&mut cb_handles),
                     }
                 }
@@ -178,7 +182,7 @@ impl EventLoop {
         // callbacks
         while let Some(handle) = cb_handles.pop_front() {
             if !handle.cancelled() {
-                handle.run(py, self);
+                handle.run(py, self, state);
             }
         }
 
@@ -236,17 +240,19 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>, read_buf: &mut [u8]) {
+    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>) {
         let fd = event.token().0;
-        let mut stream_ref = self.tcp_streams.get_mut(&fd).unwrap();
-        let io = stream_ref.value_mut();
-
+        // println!("handle_io_tcps({:?}) {:?} {:?} {:?} {:?}", fd, event.is_readable(), event.is_writable(), event.is_read_closed(), event.is_write_closed());
         if event.is_readable() {
-            if let Some(handle) = io.recv(event, fd, read_buf) {
-                handles_ready.push_back(handle);
-            }
+            handles_ready.push_back(Arc::new(TCPReadHandle {
+                fd,
+                closed: event.is_read_closed(),
+            }));
         } else if event.is_writable() {
-            handles_ready.push_back(io.send(event, fd));
+            handles_ready.push_back(Arc::new(TCPWriteHandle {
+                fd,
+                closed: event.is_write_closed(),
+            }));
         }
     }
 
@@ -430,6 +436,17 @@ impl EventLoop {
         let mut stream_ref = self.tcp_streams.get_mut(&fd).unwrap();
         let io = stream_ref.value_mut();
         func(io)
+    }
+
+    pub(crate) fn try_with_tcp_stream<T, R>(&self, fd: usize, func: T) -> Result<R>
+    where
+        T: FnOnce(&mut TCPStream) -> Result<R>,
+    {
+        if let Some(mut stream_ref) = self.tcp_streams.try_get_mut(&fd).try_unwrap() {
+            let io = stream_ref.value_mut();
+            return func(io);
+        }
+        Err(anyhow::anyhow!("fatal RLoop error: would deadlock"))
     }
 
     pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {

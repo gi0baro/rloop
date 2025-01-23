@@ -2,13 +2,13 @@ use pyo3::{prelude::*, IntoPyObjectExt};
 use std::sync::{atomic, Arc};
 
 use crate::{
-    event_loop::EventLoop,
+    event_loop::{EventLoop, EventLoopRunState},
     log::LogExc,
     py::{run_in_ctx, run_in_ctx0, run_in_ctx1},
 };
 
 pub(crate) trait Handle {
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop);
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState);
     fn cancel(&self) {}
     fn cancelled(&self) -> bool {
         false
@@ -82,7 +82,7 @@ macro_rules! handle_cancel_impl {
 impl Handle for CBHandle {
     handle_cancel_impl!();
 
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop) {
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let ctx = self.context.as_ptr();
         let cb = self.callback.as_ptr();
         let args = self.args.as_ptr();
@@ -101,7 +101,7 @@ impl Handle for CBHandle {
 impl Handle for CBHandleNoArgs {
     handle_cancel_impl!();
 
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop) {
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let ctx = self.context.as_ptr();
         let cb = self.callback.as_ptr();
 
@@ -119,7 +119,7 @@ impl Handle for CBHandleNoArgs {
 impl Handle for CBHandleOneArg {
     handle_cancel_impl!();
 
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop) {
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let ctx = self.context.as_ptr();
         let cb = self.callback.as_ptr();
         let arg = self.arg.as_ptr();
