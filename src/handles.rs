@@ -4,8 +4,11 @@ use std::sync::{atomic, Arc};
 use crate::{
     event_loop::{EventLoop, EventLoopRunState},
     log::LogExc,
-    py::{run_in_ctx, run_in_ctx0, run_in_ctx1},
+    py::{run_in_ctx, run_in_ctx0},
 };
+
+#[cfg(not(PyPy))]
+use crate::py::run_in_ctx1;
 
 pub(crate) trait Handle {
     fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState);
@@ -119,12 +122,29 @@ impl Handle for CBHandleNoArgs {
 impl Handle for CBHandleOneArg {
     handle_cancel_impl!();
 
+    #[cfg(not(PyPy))]
     fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let ctx = self.context.as_ptr();
         let cb = self.callback.as_ptr();
         let arg = self.arg.as_ptr();
 
         if let Err(err) = run_in_ctx1!(py, ctx, cb, arg) {
+            let err_ctx = LogExc::cb_handle(
+                err,
+                format!("Exception in callback {:?}", self.callback.bind(py)),
+                PyHandle { handle: self }.into_py_any(py).unwrap(),
+            );
+            _ = event_loop.log_exception(py, err_ctx);
+        }
+    }
+
+    #[cfg(PyPy)]
+    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let ctx = self.context.as_ptr();
+        let cb = self.callback.as_ptr();
+        let args = (self.arg.clone_ref(py),).into_pyobject(py).unwrap().into_ptr();
+
+        if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
             let err_ctx = LogExc::cb_handle(
                 err,
                 format!("Exception in callback {:?}", self.callback.bind(py)),

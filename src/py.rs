@@ -64,6 +64,7 @@ macro_rules! run_in_ctx0 {
     };
 }
 
+#[cfg(not(PyPy))]
 macro_rules! run_in_ctx1 {
     ($py:expr, $ctx:expr, $cb:expr, $arg:expr) => {
         unsafe {
@@ -88,4 +89,6 @@ macro_rules! run_in_ctx {
 
 pub(crate) use run_in_ctx;
 pub(crate) use run_in_ctx0;
+
+#[cfg(not(PyPy))]
 pub(crate) use run_in_ctx1;
