@@ -148,7 +148,7 @@ class _PipeReadTransport(_transports.ReadTransport):
                 self._protocol.data_received(data)
             else:
                 self._closing = True
-                self._loop._reader_rem(self._fileno)
+                self._loop.remove_reader(self._fileno)
                 self._loop.call_soon(self._protocol.eof_received)
                 self._loop.call_soon(self._call_connection_lost, None)
 
@@ -156,7 +156,7 @@ class _PipeReadTransport(_transports.ReadTransport):
         if not self.is_reading():
             return
         self._paused = True
-        self._loop._reader_rem(self._fileno)
+        self._loop.remove_reader(self._fileno)
 
     def resume_reading(self):
         if self._closing or not self._paused:
@@ -195,7 +195,7 @@ class _PipeReadTransport(_transports.ReadTransport):
 
     def _close(self, exc):
         self._closing = True
-        self._loop._reader_rem(self._fileno)
+        self._loop.remove_reader(self._fileno)
         self._loop.call_soon(self._call_connection_lost, exc)
 
     def _call_connection_lost(self, exc):
@@ -290,15 +290,15 @@ class _PipeWriteTransport(_TransportFlowControl, _transports.WriteTransport):
             self._conn_lost += 1
             # Remove writer here, _fatal_error() doesn't it
             # because _buffer is empty.
-            self._loop._writer_rem(self._fileno)
+            self._loop.remove_writer(self._fileno)
             self._fatal_error(exc, 'Fatal write error on pipe transport')
         else:
             if n == len(self._buffer):
                 self._buffer.clear()
-                self._loop._writer_rem(self._fileno)
+                self._loop.remove_writer(self._fileno)
                 self._maybe_resume_protocol()  # May append to buffer.
                 if self._closing:
-                    self._loop._reader_rem(self._fileno)
+                    self._loop.remove_reader(self._fileno)
                     self._call_connection_lost(None)
                 return
             elif n > 0:
@@ -313,7 +313,7 @@ class _PipeWriteTransport(_TransportFlowControl, _transports.WriteTransport):
         assert self._pipe
         self._closing = True
         if not self._buffer:
-            self._loop._reader_rem(self._fileno)
+            self._loop.remove_reader(self._fileno)
             self._loop.call_soon(self._call_connection_lost, None)
 
     def set_protocol(self, protocol):
@@ -352,9 +352,9 @@ class _PipeWriteTransport(_TransportFlowControl, _transports.WriteTransport):
     def _close(self, exc=None):
         self._closing = True
         if self._buffer:
-            self._loop._writer_rem(self._fileno)
+            self._loop.remove_writer(self._fileno)
         self._buffer.clear()
-        self._loop._reader_rem(self._fileno)
+        self._loop.remove_reader(self._fileno)
         self._loop.call_soon(self._call_connection_lost, exc)
 
     def _call_connection_lost(self, exc):

@@ -749,23 +749,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def _child_watcher_callback(self, pid, returncode, transp):
         self.call_soon_threadsafe(transp._process_exited, returncode)
 
-    #: ready-based callback registration methods
-    def add_reader(self, fd, callback, *args) -> CBHandle:
-        return self._reader_add(fd, callback, args, _copy_context())
-
-    def remove_reader(self, fd) -> bool:
-        return self._reader_rem(fd)
-
-    def add_writer(self, fd, callback, *args) -> CBHandle:
-        return self._writer_add(fd, callback, args, _copy_context())
-
-    def remove_writer(self, fd) -> bool:
-        return self._writer_rem(fd)
-
     #: completion based I/O methods
     def sock_recv(self, sock, nbytes) -> _Future:
         future = _SyncSockReaderFuture(sock, self)
-        self._reader_add(sock.fileno(), self._sock_recv, (future, sock, nbytes), _copy_context())
+        self.add_reader(sock.fileno(), self._sock_recv, future, sock, nbytes)
         return future
 
     def _sock_recv(self, fut, sock, n):
@@ -777,14 +764,14 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise
         except BaseException as exc:
             fut.set_exception(exc)
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
         else:
             fut.set_result(data)
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
 
     def sock_recv_into(self, sock, buf) -> _Future:
         future = _SyncSockReaderFuture(sock, self)
-        self._reader_add(sock.fileno(), self._sock_recv_into, (future, sock, buf), _copy_context())
+        self.add_reader(sock.fileno(), self._sock_recv_into, future, sock, buf)
         return future
 
     def _sock_recv_into(self, fut, sock, buf):
@@ -796,10 +783,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise
         except BaseException as exc:
             fut.set_exception(exc)
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
         else:
             fut.set_result(data)
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
 
     # async def sock_recvfrom(self, sock, bufsize):
     #     raise NotImplementedError
@@ -822,7 +809,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             data = data[n:]
 
         future = _SyncSockWriterFuture(sock, self)
-        self._writer_add(sock.fileno(), self._sock_sendall, (future, sock, data), _copy_context())
+        self.add_writer(sock.fileno(), self._sock_sendall, future, sock, data)
         return await future
 
     def _sock_sendall(self, fut, sock, data):
@@ -834,15 +821,15 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise
         except BaseException as exc:
             fut.set_exception(exc)
-            self._writer_rem(sock.fileno())
+            self.remove_writer(sock.fileno())
             return
 
-        self._writer_rem(sock.fileno())
+        self.remove_writer(sock.fileno())
         if n == len(data):
             fut.set_result(None)
         else:
             data = data[n:]
-            self._writer_add(sock.fileno(), self._sock_sendall, (fut, sock, data), _copy_context())
+            self.add_writer(sock.fileno(), self._sock_sendall, fut, sock, data)
 
     # async def sock_sendto(self, sock, data, address):
     #     raise NotImplementedError
@@ -879,7 +866,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             return
 
         future = _SyncSockWriterFuture(sock, self)
-        self._writer_add(sock.fileno(), self._sock_connect_cb, (future, sock, address), _copy_context())
+        self.add_writer(sock.fileno(), self._sock_connect_cb, future, sock, address)
         return future
 
     def _sock_connect_cb(self, fut, sock, address):
@@ -894,14 +881,14 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise
         except BaseException as exc:
             fut.set_exception(exc)
-            self._writer_rem(sock.fileno())
+            self.remove_writer(sock.fileno())
         else:
             fut.set_result(None)
-            self._writer_rem(sock.fileno())
+            self.remove_writer(sock.fileno())
 
     def sock_accept(self, sock) -> _Future:
         future = _SyncSockReaderFuture(sock, self)
-        self._reader_add(sock.fileno(), self._sock_accept, (future, sock), _copy_context())
+        self.add_reader(sock.fileno(), self._sock_accept, future, sock)
         return future
 
     def _sock_accept(self, fut, sock):
@@ -914,10 +901,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             raise
         except BaseException as exc:
             fut.set_exception(exc)
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
         else:
             fut.set_result((conn, address))
-            self._reader_rem(sock.fileno())
+            self.remove_reader(sock.fileno())
 
     # async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=None):
     #     raise NotImplementedError
