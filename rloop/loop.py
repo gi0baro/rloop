@@ -21,6 +21,7 @@ from ._compat import _PY_311, _PYV
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
 from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
+from .server import Server
 from .subprocess import (
     _PidfdChildWatcher,
     _PipeReadTransport,
@@ -583,10 +584,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         # server = self._tcp_server(sockets, rsocks, protocol_factory, backlog,
         #                 ssl, ssl_handshake_timeout,
         #                 ssl_shutdown_timeout)
-        server = self._tcp_server(sockets, rsocks, protocol_factory, backlog)
+        server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
 
         if start_serving:
-            server._start_serving()
+            server.start_serving()
 
         return server
 

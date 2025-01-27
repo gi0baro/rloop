@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use std::sync::{atomic, RwLock};
+use std::sync::atomic;
 
 use crate::event_loop::EventLoop;
 use crate::tcp::TCPServer;
@@ -10,7 +10,7 @@ enum ServerType {
     // Unix,
 }
 
-#[pyclass(frozen, subclass, module = "granian._granian")]
+#[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct Server {
     #[pyo3(get)]
     _loop: Py<EventLoop>,
@@ -19,8 +19,7 @@ pub(crate) struct Server {
     closed: atomic::AtomicBool,
     serving: atomic::AtomicBool,
     servers: Vec<ServerType>,
-    serve_forever_fut: RwLock<Option<PyObject>>,
-    // waiters: RwLock<Vec<PyObject>>,
+    // serve_forever_fut: RwLock<Option<PyObject>>,
 }
 
 impl Server {
@@ -33,7 +32,7 @@ impl Server {
             closed: false.into(),
             serving: false.into(),
             servers: srv,
-            serve_forever_fut: RwLock::new(None),
+            // serve_forever_fut: RwLock::new(None),
             // waiters: RwLock::new(Vec::new()),
         }
     }
@@ -47,17 +46,17 @@ impl Server {
     //     guard.push(waiter);
     // }
 
-    #[getter(_sff)]
-    fn _get_sff(&self, py: Python) -> Option<PyObject> {
-        let guard = self.serve_forever_fut.read().unwrap();
-        guard.as_ref().map(|v| v.clone_ref(py))
-    }
+    // #[getter(_sff)]
+    // fn _get_sff(&self, py: Python) -> Option<PyObject> {
+    //     let guard = self.serve_forever_fut.read().unwrap();
+    //     guard.as_ref().map(|v| v.clone_ref(py))
+    // }
 
-    #[setter(_sff)]
-    fn _set_sff(&self, val: PyObject) {
-        let mut guard = self.serve_forever_fut.write().unwrap();
-        *guard = Some(val);
-    }
+    // #[setter(_sff)]
+    // fn _set_sff(&self, val: PyObject) {
+    //     let mut guard = self.serve_forever_fut.write().unwrap();
+    //     *guard = Some(val);
+    // }
 
     fn _start_serving(&self, py: Python) -> PyResult<()> {
         for server in &self.servers {
@@ -69,7 +68,7 @@ impl Server {
         Ok(())
     }
 
-    fn is_serving(&self) -> bool {
+    fn _is_serving(&self) -> bool {
         self.serving.load(atomic::Ordering::Relaxed)
     }
 
@@ -91,7 +90,7 @@ impl Server {
         // Ok(())
     }
 
-    fn close_clients(&self, py: Python) {
+    fn _streams_close(&self, py: Python) {
         let event_loop = self._loop.get();
         for server in &self.servers {
             match server {
@@ -100,7 +99,7 @@ impl Server {
         }
     }
 
-    fn abort_clients(&self, py: Python) {
+    fn _streams_abort(&self, py: Python) {
         let event_loop = self._loop.get();
         for server in &self.servers {
             match server {

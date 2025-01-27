@@ -3,7 +3,7 @@ use std::os::raw::c_int;
 
 use crate::py::sock;
 
-#[pyclass(frozen, module = "granian._granian")]
+#[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct SocketWrapper {
     sock: PyObject,
 }

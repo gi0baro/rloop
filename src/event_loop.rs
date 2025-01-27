@@ -423,13 +423,13 @@ impl EventLoop {
         }
     }
 
-    pub(crate) fn with_tcp_listener_streams<T, R>(&self, fd: usize, func: T) -> R
+    pub(crate) fn with_tcp_listener_streams<T>(&self, fd: usize, func: T)
     where
-        T: FnOnce(&HashSet<usize>) -> R,
+        T: FnOnce(&HashSet<usize>),
     {
-        let streams_ref = self.tcp_lstreams.get(&fd).unwrap();
-        let io = streams_ref.value();
-        func(io)
+        if let Some(streams_ref) = self.tcp_lstreams.get(&fd) {
+            func(streams_ref.value());
+        }
     }
 
     pub(crate) fn with_tcp_stream<T, R>(&self, fd: usize, func: T) -> R
