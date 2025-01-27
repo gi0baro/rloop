@@ -1057,8 +1057,7 @@ impl EventLoop {
     fn _run(&self, py: Python) -> PyResult<()> {
         let mut state = EventLoopRunState {
             events: event::Events::with_capacity(128),
-            #[allow(clippy::large_stack_arrays)]
-            read_buf: [0; 262_144].into(),
+            read_buf: vec![0; 262_144].into_boxed_slice(),
             tick_last: 0,
         };
 
