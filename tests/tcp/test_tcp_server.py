@@ -6,6 +6,17 @@ import pytest
 
 from rloop.utils import _HAS_IPv6
 
+from . import BaseProto
+
+
+_SIZE = 1024 * 1000
+
+
+class EchoProtocol(BaseProto):
+    def data_received(self, data):
+        super().data_received(data)
+        self.transport.write(data)
+
 
 @pytest.mark.skipif(not hasattr(socket, 'SOCK_NONBLOCK'), reason='no socket.SOCK_NONBLOCK')
 def test_create_server_stream_bittype(loop):
@@ -34,3 +45,33 @@ def test_create_server_ipv6(loop):
             pass
         else:
             raise
+
+
+def test_tcp_server_recv_send(loop):
+    msg = b'a' * _SIZE
+    state = {'data': b''}
+    proto = EchoProtocol()
+
+    async def main():
+        sock = socket.socket()
+        sock.setblocking(False)
+
+        with sock:
+            sock.bind(('127.0.0.1', 0))
+            addr = sock.getsockname()
+            srv = await loop.create_server(lambda: proto, sock=sock)
+            fut = loop.run_in_executor(None, client, addr)
+            await fut
+            srv.close()
+
+    def client(addr):
+        sock = socket.socket()
+        with sock:
+            sock.connect(addr)
+            sock.sendall(msg)
+            while len(state['data']) < _SIZE:
+                state['data'] += sock.recv(1024 * 16)
+
+    loop.run_until_complete(main())
+    assert proto.state == 'CLOSED'
+    assert state['data'] == msg

@@ -242,7 +242,6 @@ impl EventLoop {
     #[inline]
     fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<HandleRef>) {
         let fd = event.token().0;
-        // println!("handle_io_tcps({:?}) {:?} {:?} {:?} {:?}", fd, event.is_readable(), event.is_writable(), event.is_read_closed(), event.is_write_closed());
         if event.is_readable() {
             handles_ready.push_back(Arc::new(TCPReadHandle {
                 fd,
@@ -596,32 +595,32 @@ impl EventLoop {
 
     #[getter(_closed)]
     fn _get_closed(&self) -> bool {
-        self.closed.load(atomic::Ordering::Relaxed)
+        self.closed.load(atomic::Ordering::Acquire)
     }
 
     #[setter(_closed)]
     fn _set_closed(&self, val: bool) {
-        self.closed.store(val, atomic::Ordering::Relaxed);
+        self.closed.store(val, atomic::Ordering::Release);
     }
 
     #[getter(_stopping)]
     fn _get_stopping(&self) -> bool {
-        self.stopping.load(atomic::Ordering::Relaxed)
+        self.stopping.load(atomic::Ordering::Acquire)
     }
 
     #[setter(_stopping)]
     fn _set_stopping(&self, val: bool) {
-        self.stopping.store(val, atomic::Ordering::Relaxed);
+        self.stopping.store(val, atomic::Ordering::Release);
     }
 
     #[getter(_asyncgens_shutdown_called)]
     fn _get_asyncgens_shutdown_called(&self) -> bool {
-        self.shutdown_called_asyncgens.load(atomic::Ordering::Relaxed)
+        self.shutdown_called_asyncgens.load(atomic::Ordering::Acquire)
     }
 
     #[setter(_asyncgens_shutdown_called)]
     fn _set_asyncgens_shutdown_called(&self, val: bool) {
-        self.shutdown_called_asyncgens.store(val, atomic::Ordering::Relaxed);
+        self.shutdown_called_asyncgens.store(val, atomic::Ordering::Release);
     }
 
     #[getter(_default_executor)]
@@ -1068,7 +1067,7 @@ impl EventLoop {
             // let t = Instant::now();
             if let Err(err) = self.step(py, &mut state) {
                 if err.kind() == std::io::ErrorKind::Interrupted
-                    && self.sig_loop_handled.swap(false, atomic::Ordering::Release)
+                    && self.sig_loop_handled.swap(false, atomic::Ordering::Relaxed)
                 {
                     continue;
                 }

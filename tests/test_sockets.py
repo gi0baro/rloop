@@ -1,5 +1,4 @@
 import socket
-import threading
 
 
 _SIZE = 1024 * 1024
@@ -21,12 +20,13 @@ def test_socket_accept_recv(loop):
             sock.bind(('127.0.0.1', 0))
             sock.listen()
 
-            cth = threading.Thread(target=client, args=(sock.getsockname(),))
-            cth.start()
+            fut = loop.run_in_executor(None, client, sock.getsockname())
 
             client_sock, _ = await loop.sock_accept(sock)
             with client_sock:
                 data = await _recv_all(loop, client_sock, _SIZE)
+
+            await fut
 
         return data
 
@@ -51,14 +51,13 @@ def test_socket_accept_send(loop):
             sock.bind(('127.0.0.1', 0))
             sock.listen()
 
-            cth = threading.Thread(target=client, args=(sock.getsockname(),))
-            cth.start()
+            fut = loop.run_in_executor(None, client, sock.getsockname())
 
             client_sock, _ = await loop.sock_accept(sock)
             with client_sock:
                 await loop.sock_sendall(client_sock, b'a' * _SIZE)
 
-            cth.join()
+            await fut
 
     def client(addr):
         sock = socket.socket()

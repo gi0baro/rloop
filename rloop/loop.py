@@ -347,14 +347,14 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                 raise ValueError('host/port and sock can not be specified at the same time')
 
             infos = await self._ensure_resolved(
-                (host, port), family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags, loop=self
+                (host, port), family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
             )
             if not infos:
                 raise OSError('getaddrinfo() returned empty list')
 
             if local_addr is not None:
                 laddr_infos = await self._ensure_resolved(
-                    local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags, loop=self
+                    local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
                 )
                 if not laddr_infos:
                     raise OSError('getaddrinfo() returned empty list')
@@ -587,7 +587,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
 
         if start_serving:
-            server.start_serving()
+            await server.start_serving()
 
         return server
 
