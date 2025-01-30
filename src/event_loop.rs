@@ -110,7 +110,7 @@ impl EventLoop {
                 if let Some(timer) = guard_sched.peek() {
                     let tick = Instant::now().duration_since(self.epoch).as_micros();
                     if timer.when > tick {
-                        let dt = ((timer.when - tick) / 1000) as u64;
+                        let dt = (timer.when - tick) as u64;
                         sched_time = Some(dt);
                     }
                 }
@@ -128,7 +128,7 @@ impl EventLoop {
                     if sched_time.is_none() {
                         self.idle.store(true, atomic::Ordering::Release);
                     }
-                    let res = io.poll(&mut state.events, sched_time.map(Duration::from_millis));
+                    let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
                     if let Err(ref err) = res {
                         if err.kind() == std::io::ErrorKind::Interrupted {
                             // if we got an interrupt, we retry ready events (as we might need to process signals)

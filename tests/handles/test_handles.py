@@ -27,7 +27,7 @@ def test_call_later(loop):
         loop.stop()
 
     loop.call_later(0.001, cb, 2)
-    loop.call_later(1.0, stop)
+    loop.call_later(0.1, stop)
     loop.call_soon(cb, 1)
     loop.run_forever()
     assert calls == [1, 2]
