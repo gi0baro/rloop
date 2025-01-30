@@ -22,6 +22,30 @@ loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 ```
 
+## Differences from stdlib
+
+At current time, in comparison with the stdlib's event loop, RLoop doesn't support the following features:
+
+- UDP
+- Unix domain sockets
+- SSL
+- debugging
+
+RLoop also doesn't implement the following methods:
+
+- `loop.sendfile`
+- `loop.connect_accepted_socket`
+- `loop.sock_recvfrom`
+- `loop.sock_recvfrom_into`
+- `loop.sock_sendto`
+- `loop.sock_sendfile`
+
+### Differences in behaviour
+
+#### `call_later` with negative delays
+
+While the stdlib's event loop will use the actual delay of callbacks when `call_later` is used with negative numbers, RLoop will treat those as `call_soon`, and thus the effective order will follow the invocation order, not the delay.
+
 ## License
 
 RLoop is released under the BSD License.
