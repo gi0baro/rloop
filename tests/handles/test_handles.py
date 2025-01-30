@@ -18,15 +18,19 @@ def test_call_soon(loop):
 
 
 def test_call_later(loop):
-    def cb():
+    calls = []
+
+    def cb(arg):
+        calls.append(arg)
+
+    def stop():
         loop.stop()
 
-    loop.call_later(0.001, cb)
-    t0 = loop.time()
+    loop.call_later(0.001, cb, 2)
+    loop.call_later(1.0, stop)
+    loop.call_soon(cb, 1)
     loop.run_forever()
-    dt = loop.time() - t0
-
-    assert dt >= 0.001
+    assert calls == [1, 2]
 
 
 def test_call_later_negative(loop):
