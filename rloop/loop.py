@@ -751,9 +751,21 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         self.call_soon_threadsafe(transp._process_exited, returncode)
 
     #: completion based I/O methods
+    def _ensure_fd_no_transport(self, fd):
+        fileno = fd
+        if not isinstance(fileno, int):
+            try:
+                fileno = int(fileno.fileno())
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError(f"Invalid file object: {fd!r}") from None
+        if self._tcp_stream_bound(fileno):
+            raise RuntimeError(f'File descriptor {fd!r} is used by transport')
+
     def sock_recv(self, sock, nbytes) -> _Future:
         future = _SyncSockReaderFuture(sock, self)
-        self.add_reader(sock.fileno(), self._sock_recv, future, sock, nbytes)
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
+        self.add_reader(fd, self._sock_recv, future, sock, nbytes)
         return future
 
     def _sock_recv(self, fut, sock, n):
@@ -772,7 +784,9 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     def sock_recv_into(self, sock, buf) -> _Future:
         future = _SyncSockReaderFuture(sock, self)
-        self.add_reader(sock.fileno(), self._sock_recv_into, future, sock, buf)
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
+        self.add_reader(fd, self._sock_recv_into, future, sock, buf)
         return future
 
     def _sock_recv_into(self, fut, sock, buf):
@@ -809,8 +823,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             data = memoryview(data)
             data = data[n:]
 
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
         future = _SyncSockWriterFuture(sock, self)
-        self.add_writer(sock.fileno(), self._sock_sendall, future, sock, data)
+        self.add_writer(fd, self._sock_sendall, future, sock, data)
         return await future
 
     def _sock_sendall(self, fut, sock, data):
@@ -866,8 +882,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         else:
             return
 
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
         future = _SyncSockWriterFuture(sock, self)
-        self.add_writer(sock.fileno(), self._sock_connect_cb, future, sock, address)
+        self.add_writer(fd, self._sock_connect_cb, future, sock, address)
         return future
 
     def _sock_connect_cb(self, fut, sock, address):
@@ -888,8 +906,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             self.remove_writer(sock.fileno())
 
     def sock_accept(self, sock) -> _Future:
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
         future = _SyncSockReaderFuture(sock, self)
-        self.add_reader(sock.fileno(), self._sock_accept, future, sock)
+        self.add_reader(fd, self._sock_accept, future, sock)
         return future
 
     def _sock_accept(self, fut, sock):

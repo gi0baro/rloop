@@ -17,6 +17,10 @@ class ProtoClient(BaseProto):
         transport.write(b'hello')
         transport.write_eof()
 
+    def data_received(self, data):
+        super().data_received(data)
+        self.data += data
+
 
 def test_tcp_connection_send(loop):
     proto_srv = ProtoServer()
@@ -38,3 +42,4 @@ def test_tcp_connection_send(loop):
     assert proto_cli.state == 'CLOSED'
     assert proto_srv.state == 'CLOSED'
     assert proto_srv.data == b'hello'
+    assert proto_cli.data == b'hello back'

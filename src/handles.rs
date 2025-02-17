@@ -1,5 +1,5 @@
 use pyo3::{prelude::*, IntoPyObjectExt};
-use std::sync::{atomic, Arc};
+use std::sync::atomic;
 
 use crate::{
     event_loop::{EventLoop, EventLoopRunState},
@@ -11,18 +11,33 @@ use crate::{
 use crate::py::run_in_ctx1;
 
 pub(crate) trait Handle {
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState);
-    fn cancel(&self) {}
+    fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState);
     fn cancelled(&self) -> bool {
         false
     }
 }
 
-pub(crate) type HandleRef = Arc<dyn Handle + Send + Sync>;
+pub(crate) type BoxedHandle = Box<dyn Handle + Send>;
 
+#[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct CBHandle {
     callback: PyObject,
     args: PyObject,
+    context: PyObject,
+    cancelled: atomic::AtomicBool,
+}
+
+#[pyclass(frozen, module = "rloop._rloop", name = "CBHandle0")]
+pub(crate) struct CBHandleNoArgs {
+    callback: PyObject,
+    context: PyObject,
+    cancelled: atomic::AtomicBool,
+}
+
+#[pyclass(frozen, module = "rloop._rloop", name = "CBHandle1")]
+pub(crate) struct CBHandleOneArg {
+    callback: PyObject,
+    arg: PyObject,
     context: PyObject,
     cancelled: atomic::AtomicBool,
 }
@@ -37,6 +52,7 @@ impl CBHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new0(callback: PyObject, context: PyObject) -> CBHandleNoArgs {
         CBHandleNoArgs {
             callback,
@@ -55,132 +71,115 @@ impl CBHandle {
     }
 }
 
-pub(crate) struct CBHandleNoArgs {
-    callback: PyObject,
-    context: PyObject,
-    cancelled: atomic::AtomicBool,
-}
-
-pub(crate) struct CBHandleOneArg {
-    callback: PyObject,
-    arg: PyObject,
-    context: PyObject,
-    cancelled: atomic::AtomicBool,
-}
-
-macro_rules! handle_cancel_impl {
-    () => {
-        #[inline]
-        fn cancel(&self) {
-            self.cancelled.store(true, atomic::Ordering::Release);
-        }
-
-        #[inline]
-        fn cancelled(&self) -> bool {
-            self.cancelled.load(atomic::Ordering::Relaxed)
+macro_rules! cbhandle_cancel_impl {
+    ($handle:ident) => {
+        #[pymethods]
+        impl $handle {
+            fn cancel(&self) {
+                self.cancelled.store(true, atomic::Ordering::Relaxed);
+            }
         }
     };
 }
 
-impl Handle for CBHandle {
-    handle_cancel_impl!();
+macro_rules! cbhandle_cancelled_impl {
+    () => {
+        #[inline]
+        fn cancelled(&self) -> bool {
+            self.get().cancelled.load(atomic::Ordering::Relaxed)
+        }
+    };
+}
 
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let ctx = self.context.as_ptr();
-        let cb = self.callback.as_ptr();
-        let args = self.args.as_ptr();
+cbhandle_cancel_impl!(CBHandle);
+cbhandle_cancel_impl!(CBHandleNoArgs);
+cbhandle_cancel_impl!(CBHandleOneArg);
+
+impl Handle for Py<CBHandle> {
+    cbhandle_cancelled_impl!();
+
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let rself = self.get();
+        let ctx = rself.context.as_ptr();
+        let cb = rself.callback.as_ptr();
+        let args = rself.args.as_ptr();
 
         if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
             let err_ctx = LogExc::cb_handle(
                 err,
-                format!("Exception in callback {:?}", self.callback.bind(py)),
-                PyHandle { handle: self }.into_py_any(py).unwrap(),
+                format!("Exception in callback {:?}", rself.callback.bind(py)),
+                self.clone_ref(py).into_py_any(py).unwrap(),
             );
             _ = event_loop.log_exception(py, err_ctx);
         }
     }
 }
 
-impl Handle for CBHandleNoArgs {
-    handle_cancel_impl!();
+impl Handle for Py<CBHandleNoArgs> {
+    cbhandle_cancelled_impl!();
 
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let ctx = self.context.as_ptr();
-        let cb = self.callback.as_ptr();
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let rself = self.get();
+        let ctx = rself.context.as_ptr();
+        let cb = rself.callback.as_ptr();
 
         if let Err(err) = run_in_ctx0!(py, ctx, cb) {
             let err_ctx = LogExc::cb_handle(
                 err,
-                format!("Exception in callback {:?}", self.callback.bind(py)),
-                PyHandle { handle: self }.into_py_any(py).unwrap(),
+                format!("Exception in callback {:?}", rself.callback.bind(py)),
+                self.clone_ref(py).into_py_any(py).unwrap(),
             );
             _ = event_loop.log_exception(py, err_ctx);
         }
     }
 }
 
-impl Handle for CBHandleOneArg {
-    handle_cancel_impl!();
-
+impl Handle for Py<CBHandleOneArg> {
     #[cfg(not(PyPy))]
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let ctx = self.context.as_ptr();
-        let cb = self.callback.as_ptr();
-        let arg = self.arg.as_ptr();
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let rself = self.get();
+        let ctx = rself.context.as_ptr();
+        let cb = rself.callback.as_ptr();
+        let arg = rself.arg.as_ptr();
 
         if let Err(err) = run_in_ctx1!(py, ctx, cb, arg) {
             let err_ctx = LogExc::cb_handle(
                 err,
-                format!("Exception in callback {:?}", self.callback.bind(py)),
-                PyHandle { handle: self }.into_py_any(py).unwrap(),
+                format!("Exception in callback {:?}", rself.callback.bind(py)),
+                self.clone_ref(py).into_py_any(py).unwrap(),
             );
             _ = event_loop.log_exception(py, err_ctx);
         }
     }
 
     #[cfg(PyPy)]
-    fn run(self: Arc<Self>, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let ctx = self.context.as_ptr();
-        let cb = self.callback.as_ptr();
-        let args = (self.arg.clone_ref(py),).into_pyobject(py).unwrap().into_ptr();
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let rself = self.get();
+        let ctx = rself.context.as_ptr();
+        let cb = rself.callback.as_ptr();
+        let args = (rself.arg,).into_py_any(py).into_ptr();
 
         if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
             let err_ctx = LogExc::cb_handle(
                 err,
-                format!("Exception in callback {:?}", self.callback.bind(py)),
-                PyHandle { handle: self }.into_py_any(py).unwrap(),
+                format!("Exception in callback {:?}", rself.callback.bind(py)),
+                self.clone_ref(py).into_py_any(py).unwrap(),
             );
             _ = event_loop.log_exception(py, err_ctx);
         }
     }
 }
 
-#[pyclass(frozen, name = "CBHandle", module = "rloop._rloop")]
-pub(crate) struct PyHandle {
-    pub handle: HandleRef,
-}
-
-#[pymethods]
-impl PyHandle {
-    fn cancel(&self) {
-        self.handle.cancel();
-    }
-
-    fn cancelled(&self) -> bool {
-        self.handle.cancelled()
-    }
-}
-
-#[pyclass(frozen, name = "TimerHandle", module = "rloop._rloop")]
-pub(crate) struct PyTimerHandle {
-    pub handle: HandleRef,
+#[pyclass(frozen, module = "rloop._rloop")]
+pub(crate) struct TimerHandle {
+    pub handle: Py<CBHandle>,
     #[pyo3(get)]
     when: f64,
 }
 
-impl PyTimerHandle {
+impl TimerHandle {
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn new(handle: HandleRef, when: u128) -> Self {
+    pub(crate) fn new(handle: Py<CBHandle>, when: u128) -> Self {
         Self {
             handle,
             when: (when as f64) / 1_000_000.0,
@@ -189,9 +188,9 @@ impl PyTimerHandle {
 }
 
 #[pymethods]
-impl PyTimerHandle {
+impl TimerHandle {
     fn cancel(&self) {
-        self.handle.cancel();
+        self.handle.get().cancel();
     }
 
     fn cancelled(&self) -> bool {
@@ -200,8 +199,8 @@ impl PyTimerHandle {
 }
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
-    module.add_class::<PyHandle>()?;
-    module.add_class::<PyTimerHandle>()?;
+    module.add_class::<CBHandle>()?;
+    module.add_class::<TimerHandle>()?;
 
     Ok(())
 }

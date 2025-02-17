@@ -34,7 +34,7 @@ anyhow = "=1.0"
 dashmap = { version = "=6.1", features = ["inline"] }
 mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
 pyo3 = { version = "=0.23", features = ["anyhow", "extension-module", "generate-import-lib"] }
-socket2 = "=0.5"
+socket2 = { version = "=0.5", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.159"

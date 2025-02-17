@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
 
-use crate::handles::HandleRef;
+use crate::handles::BoxedHandle;
 
 pub(crate) struct Timer {
-    pub handle: HandleRef,
+    pub handle: BoxedHandle,
     pub when: u128,
 }
 
