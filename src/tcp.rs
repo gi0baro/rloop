@@ -11,7 +11,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    io::{Read, Write},
+    io::Read,
     sync::atomic,
 };
 
@@ -651,16 +651,18 @@ pub(crate) struct TCPWriteHandle {
 impl TCPWriteHandle {
     #[inline]
     fn write(&self, transport: &TCPTransport) -> Option<usize> {
+        let fd = self.fd as i32;
         let mut ret = 0;
         let mut state = transport.state.borrow_mut();
         while let Some(data) = state.write_buf.pop_front() {
-            match state.stream.write(&data) {
-                Ok(written) if written != data.len() => {
+            match syscall!(write(fd, data.as_ptr().cast(), data.len())) {
+                Ok(written) if written as usize != data.len() => {
+                    let written = written as usize;
                     state.write_buf.push_front((&data[written..]).into());
                     ret += written;
                     break;
                 }
-                Ok(written) => ret += written,
+                Ok(written) => ret += written as usize,
                 Err(err) if err.kind() != std::io::ErrorKind::Interrupted => {
                     state.write_buf.clear();
                     state.write_buf_dsize = 0;
