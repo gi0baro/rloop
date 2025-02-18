@@ -1,9 +1,10 @@
 # RLoop
 
-RLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) event loop implemented in Rust on top of the [mio crate](https://github.com/tokio-rs/mio).
+RLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) selector event loop implemented in Rust on top of the [mio crate](https://github.com/tokio-rs/mio).
 
-> [!WARNING]
-> Disclaimer: This is a work in progress and definitely not ready for production usage.
+> **Warning**: RLoop is currently a work in progress and definitely not suited for *production usage*.
+
+> **Note:** RLoop is available on Unix systems only.
 
 ## Installation
 
@@ -24,10 +25,10 @@ asyncio.set_event_loop(loop)
 
 ## Differences from stdlib
 
-At current time, in comparison with the stdlib's event loop, RLoop doesn't support the following features:
+At current time, when compared with the stdlib's event loop, RLoop doesn't support the following features:
 
 - UDP
-- Unix domain sockets
+- Unix Domain Sockets
 - SSL
 - debugging
 
@@ -40,9 +41,7 @@ RLoop also doesn't implement the following methods:
 - `loop.sock_sendto`
 - `loop.sock_sendfile`
 
-### Differences in behaviour
-
-#### `call_later` with negative delays
+### `call_later` with negative delays
 
 While the stdlib's event loop will use the actual delay of callbacks when `call_later` is used with negative numbers, RLoop will treat those as `call_soon`, and thus the effective order will follow the invocation order, not the delay.
 
