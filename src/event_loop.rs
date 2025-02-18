@@ -20,6 +20,7 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
+    utils::py_allow_threads,
 };
 
 enum IOHandle {
@@ -164,8 +165,7 @@ impl EventLoop {
                 if sched_time.is_none() {
                     self.idle.store(true, atomic::Ordering::Release);
                 }
-                // TODO: no GIL release on 3.13t
-                let res = py.allow_threads(|| {
+                let res = py_allow_threads!(py, {
                     let mut io = self.io.lock().unwrap();
                     let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
                     if let Err(ref err) = res {
