@@ -290,15 +290,9 @@ impl EventLoop {
     fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
         let fd = event.token().0;
         if event.is_readable() {
-            handles_ready.push_back(Box::new(TCPReadHandle {
-                fd,
-                closed: event.is_read_closed(),
-            }));
+            handles_ready.push_back(Box::new(TCPReadHandle { fd }));
         } else if event.is_writable() {
-            handles_ready.push_back(Box::new(TCPWriteHandle {
-                fd,
-                closed: event.is_write_closed(),
-            }));
+            handles_ready.push_back(Box::new(TCPWriteHandle { fd }));
         }
     }
 
@@ -433,6 +427,7 @@ impl EventLoop {
                     v
                 });
             }
+            transport.drop_ref(py);
         }
     }
 
