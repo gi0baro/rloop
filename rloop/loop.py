@@ -757,7 +757,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             try:
                 fileno = int(fileno.fileno())
             except (AttributeError, TypeError, ValueError):
-                raise ValueError(f"Invalid file object: {fd!r}") from None
+                raise ValueError(f'Invalid file object: {fd!r}') from None
         if self._tcp_stream_bound(fileno):
             raise RuntimeError(f'File descriptor {fd!r} is used by transport')
 

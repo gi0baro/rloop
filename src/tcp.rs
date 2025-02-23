@@ -619,18 +619,21 @@ impl Handle for TCPReadHandle {
         // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
         //       otherwise we won't get another readable event from the poller
         let mut close = false;
+        let mut eof = true;
         loop {
             if let Some((data, more)) = match transport.proto_buffered {
                 true => self.recv_buffered(py, &transport),
                 false => self.recv_direct(py, &transport, &mut state.read_buf),
             } {
+                eof = false;
                 _ = transport.protom_recv_data.call1(py, (data,));
                 if more {
                     continue;
                 }
             }
 
-            if self.closed {
+            // NOTE: it seems self.closed is not reliable on epoll. Thus, we manually check for eof.
+            if self.closed || eof {
                 close = self.recv_eof(py, event_loop, &transport);
             }
 
@@ -651,6 +654,7 @@ pub(crate) struct TCPWriteHandle {
 impl TCPWriteHandle {
     #[inline]
     fn write(&self, transport: &TCPTransport) -> Option<usize> {
+        #[allow(clippy::cast_possible_wrap)]
         let fd = self.fd as i32;
         let mut ret = 0;
         let mut state = transport.state.borrow_mut();

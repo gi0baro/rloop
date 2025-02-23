@@ -461,6 +461,7 @@ impl EventLoop {
         )
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub fn schedule0(&self, callback: PyObject, context: Option<PyObject>) -> Result<()> {
         let handle = Python::with_gil(|py| {
             Py::new(
@@ -469,7 +470,10 @@ impl EventLoop {
             )
         })?;
         {
-            let mut guard = self.handles_ready.lock().unwrap();
+            let mut guard = self
+                .handles_ready
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
@@ -480,6 +484,7 @@ impl EventLoop {
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub fn schedule1(&self, callback: PyObject, arg: PyObject, context: Option<PyObject>) -> Result<()> {
         let handle = Python::with_gil(|py| {
             Py::new(
@@ -488,7 +493,10 @@ impl EventLoop {
             )
         })?;
         {
-            let mut guard = self.handles_ready.lock().unwrap();
+            let mut guard = self
+                .handles_ready
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
@@ -499,6 +507,7 @@ impl EventLoop {
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub fn schedule(&self, callback: PyObject, args: PyObject, context: Option<PyObject>) -> Result<()> {
         let handle = Python::with_gil(|py| {
             Py::new(
@@ -507,7 +516,10 @@ impl EventLoop {
             )
         })?;
         {
-            let mut guard = self.handles_ready.lock().unwrap();
+            let mut guard = self
+                .handles_ready
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
@@ -518,6 +530,7 @@ impl EventLoop {
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub fn schedule_later0(&self, delay: Duration, callback: PyObject, context: Option<PyObject>) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
         let handle = Python::with_gil(|py| {
@@ -531,7 +544,10 @@ impl EventLoop {
             when,
         };
         {
-            let mut guard = self.handles_sched.lock().unwrap();
+            let mut guard = self
+                .handles_sched
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
         if self.idle.load(atomic::Ordering::Acquire) {
@@ -541,7 +557,14 @@ impl EventLoop {
         Ok(())
     }
 
-    pub fn schedule_later1(&self, delay: Duration, callback: PyObject, arg: PyObject, context: Option<PyObject>) -> Result<()> {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn schedule_later1(
+        &self,
+        delay: Duration,
+        callback: PyObject,
+        arg: PyObject,
+        context: Option<PyObject>,
+    ) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
         let handle = Python::with_gil(|py| {
             Py::new(
@@ -554,7 +577,10 @@ impl EventLoop {
             when,
         };
         {
-            let mut guard = self.handles_sched.lock().unwrap();
+            let mut guard = self
+                .handles_sched
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
         if self.idle.load(atomic::Ordering::Acquire) {
@@ -564,7 +590,14 @@ impl EventLoop {
         Ok(())
     }
 
-    pub fn schedule_later(&self, delay: Duration, callback: PyObject, args: PyObject, context: Option<PyObject>) -> Result<()> {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn schedule_later(
+        &self,
+        delay: Duration,
+        callback: PyObject,
+        args: PyObject,
+        context: Option<PyObject>,
+    ) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
         let handle = Python::with_gil(|py| {
             Py::new(
@@ -577,7 +610,10 @@ impl EventLoop {
             when,
         };
         {
-            let mut guard = self.handles_sched.lock().unwrap();
+            let mut guard = self
+                .handles_sched
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
         if self.idle.load(atomic::Ordering::Acquire) {
