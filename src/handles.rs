@@ -157,7 +157,7 @@ impl Handle for Py<CBHandleOneArg> {
         let rself = self.get();
         let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
-        let args = (rself.arg,).into_py_any(py).into_ptr();
+        let args = (rself.arg.clone_ref(py),).into_py_any(py).unwrap().into_ptr();
 
         if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
             let err_ctx = LogExc::cb_handle(
