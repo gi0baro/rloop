@@ -75,3 +75,6 @@ def test_tcp_server_recv_send(loop):
     loop.run_until_complete(main())
     assert proto.state == 'CLOSED'
     assert state['data'] == msg
+
+
+# TODO: test buffered proto
