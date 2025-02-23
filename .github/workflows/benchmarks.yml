@@ -2,6 +2,10 @@ name: benchmarks
 
 on: workflow_dispatch
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   benchmark-base:
     runs-on: ubuntu-latest
