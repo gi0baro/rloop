@@ -382,14 +382,8 @@ impl TCPTransport {
     fn get_extra_info(&self, py: Python, name: &str, default: Option<PyObject>) -> Option<PyObject> {
         match name {
             "socket" => Some(self.sock.clone_ref(py).into_any()),
-            "sockname" => match self.sock.call_method0(py, pyo3::intern!(py, "getsockname")) {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            },
-            "peername" => match self.sock.call_method0(py, pyo3::intern!(py, "getpeername")) {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            },
+            "sockname" => self.sock.call_method0(py, pyo3::intern!(py, "getsockname")).ok(),
+            "peername" => self.sock.call_method0(py, pyo3::intern!(py, "getpeername")).ok(),
             _ => self.extra.get(name).map(|v| v.clone_ref(py)).or(default),
         }
     }
@@ -599,7 +593,7 @@ impl TCPReadHandle {
                     break;
                 }
                 Ok(readn) => len += readn,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 _ => break,
             }
         }
@@ -675,7 +669,6 @@ impl TCPWriteHandle {
                 Ok(written) => ret += written as usize,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                     state.write_buf.push_front(data);
-                    continue;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     state.write_buf.push_front(data);
