@@ -1,6 +1,6 @@
 use std::{
     collections::{BinaryHeap, HashSet, VecDeque},
-    io::{Read, Write},
+    io::Read,
     mem,
     os::fd::{AsRawFd, FromRawFd},
     sync::{atomic, Mutex, RwLock},
@@ -20,8 +20,10 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
-    utils::py_allow_threads,
+    utils::{py_allow_threads, syscall},
 };
+
+const WAKEB: &[u8; 1] = b"\0";
 
 enum IOHandle {
     Internal,
@@ -67,6 +69,7 @@ pub struct EventLoop {
     counter_ready: atomic::AtomicUsize,
     ssock: RwLock<Option<(socket2::Socket, socket2::Socket)>>,
     wsock: Mutex<Option<socket2::Socket>>,
+    wsock_fd: atomic::AtomicI32,
     closed: atomic::AtomicBool,
     exc_handler: RwLock<PyObject>,
     exception_handler: RwLock<PyObject>,
@@ -106,6 +109,7 @@ impl EventLoop {
         self.handles_io.insert(token, IOHandle::Internal);
         {
             let mut guard = self.wsock.lock().unwrap();
+            self.wsock_fd.store(sock_w.as_raw_fd(), atomic::Ordering::Relaxed);
             *guard = Some(sock_w);
         }
 
@@ -121,6 +125,7 @@ impl EventLoop {
     fn run_post(&self, state: &mut EventLoopRunState) {
         // cleanup wake sockets
         self.wsock.lock().unwrap().take();
+        self.wsock_fd.store(-1, atomic::Ordering::Relaxed);
         let token = Token(state.sock.as_raw_fd() as usize);
         let mut source = Source::FD(state.sock.as_raw_fd());
         {
@@ -162,12 +167,16 @@ impl EventLoop {
                 Ok(())
             }
             false => {
-                if sched_time.is_none() {
+                let idle_swap = !matches!(sched_time, Some(0));
+                if idle_swap {
                     self.idle.store(true, atomic::Ordering::Release);
                 }
                 let res = py_allow_threads!(py, {
                     let mut io = self.io.lock().unwrap();
                     let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
+                    if idle_swap {
+                        self.idle.store(false, atomic::Ordering::Release);
+                    }
                     if let Err(ref err) = res {
                         if err.kind() == std::io::ErrorKind::Interrupted {
                             // if we got an interrupt, we retry ready events (as we might need to process signals)
@@ -176,7 +185,6 @@ impl EventLoop {
                     }
                     res
                 });
-                self.idle.store(false, atomic::Ordering::Release);
                 state.tick_last = Instant::now().duration_since(self.epoch).as_micros();
                 res
             }
@@ -234,7 +242,7 @@ impl EventLoop {
         loop {
             match socket.read(&mut buf[len..]) {
                 Ok(readn) if readn > 0 => len += readn,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 _ => break,
             }
         }
@@ -325,9 +333,8 @@ impl EventLoop {
 
     #[inline(always)]
     fn wake(&self) {
-        if let Some(sock) = self.wsock.lock().unwrap().as_mut() {
-            _ = sock.write(b"\0");
-        }
+        let fd = self.wsock_fd.load(atomic::Ordering::Relaxed);
+        _ = syscall!(write(fd, WAKEB.as_ptr().cast(), 1));
     }
 
     pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
@@ -633,6 +640,7 @@ impl EventLoop {
             counter_ready: atomic::AtomicUsize::new(0),
             ssock: RwLock::new(None),
             wsock: Mutex::new(None),
+            wsock_fd: atomic::AtomicI32::new(-1),
             closed: atomic::AtomicBool::new(false),
             exc_handler: RwLock::new(py.None()),
             exception_handler: RwLock::new(py.None()),
@@ -878,17 +886,15 @@ impl EventLoop {
         .unwrap();
         let bhandle = Box::new(handle.clone_ref(py));
 
-        py.allow_threads(|| {
-            {
-                let mut guard = self.handles_ready.lock().unwrap();
-                guard.push_back(bhandle);
-            }
-            self.counter_ready.fetch_add(1, atomic::Ordering::Release);
-            // wake when necessary
-            if self.idle.load(atomic::Ordering::Acquire) {
-                self.wake();
-            }
-        });
+        {
+            let mut guard = self.handles_ready.lock().unwrap();
+            guard.push_back(bhandle);
+        }
+        self.counter_ready.fetch_add(1, atomic::Ordering::Release);
+        // wake when necessary
+        if self.idle.load(atomic::Ordering::Acquire) {
+            self.wake();
+        }
 
         handle
     }
