@@ -94,7 +94,7 @@ jobs:
       UV_PYTHON: ${{ matrix.interpreter }}
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
       - uses: dtolnay/rust-toolchain@stable
