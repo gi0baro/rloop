@@ -1,6 +1,6 @@
 [package]
 name = "rloop"
-version = "0.1.1"
+version = "0.1.2"
 description = "An asyncio event loop implemented in Rust"
 authors = ["Giovanni Barillari <g@baro.dev>"]
 license = "BSD-3-Clause"
