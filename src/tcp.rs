@@ -68,7 +68,7 @@ impl TCPServer {
     pub(crate) fn streams_close(&self, py: Python, event_loop: &EventLoop) {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
-            for stream_fd in streams {
+            for stream_fd in &streams.pin() {
                 transports.push(event_loop.get_tcp_transport(*stream_fd, py));
             }
         });
@@ -80,7 +80,7 @@ impl TCPServer {
     pub(crate) fn streams_abort(&self, py: Python, event_loop: &EventLoop) {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
-            for stream_fd in streams {
+            for stream_fd in &streams.pin() {
                 transports.push(event_loop.get_tcp_transport(*stream_fd, py));
             }
         });
@@ -264,6 +264,7 @@ impl TCPTransport {
         if self.closing.load(atomic::Ordering::Relaxed) {
             _ = self.protom_conn_lost.call1(
                 py,
+                #[allow(clippy::obfuscated_if_else)]
                 (errored
                     .then(|| {
                         pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")
