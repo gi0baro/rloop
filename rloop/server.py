@@ -27,7 +27,7 @@ class Server:
         #     raise RuntimeError(f'server {self!r} is closed')
 
         self._inner._start_serving()
-        self._sff = self._loop.create_future()
+        self._sff = self.get_loop().create_future()
 
         try:
             await self._sff
