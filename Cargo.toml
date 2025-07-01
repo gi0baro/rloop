@@ -37,7 +37,7 @@ pyo3 = { version = "=0.25", features = ["anyhow", "extension-module", "generate-
 socket2 = { version = "=0.5", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.159"
+libc = "0.2.174"
 
 [build-dependencies]
 pyo3-build-config = "=0.25"
