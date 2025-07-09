@@ -3,7 +3,7 @@ name: build
 on: workflow_dispatch
 
 env:
-  PY_ALL: 3.9 3.10 3.11 3.12 3.13 3.13t pypy3.9 pypy3.10
+  PY_ALL: 3.9 3.10 3.11 3.12 3.13 3.13t 3.14 3.14t pypy3.9 pypy3.10 pypy3.11
 
 jobs:
   wheels:
@@ -17,21 +17,22 @@ jobs:
         include:
           - os: ubuntu
             platform: linux
-          - os: ubuntu
-            platform: linux
             target: x86_64
             manylinux: auto
-            interpreter: pypy3.9 pypy3.10
-          - os: macos
-            target: x86_64
-            interpreter: pypy3.9 pypy3.10
-          - os: macos
-            target: aarch64
-            interpreter: pypy3.9 pypy3.10
+            interpreter: pypy3.9 pypy3.10 pypy3.11
+          - os: ubuntu
+            platform: linux
+            target: i686
+            interpreter: 3.9 3.10 3.11 3.12 3.13 3.14
           - os: ubuntu
             platform: linux
             target: aarch64
-            container: messense/manylinux_2_24-cross:aarch64
+            # rust-cross/manylinux2014-cross:aarch64 has issues with `ring`
+            #container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
+          - os: ubuntu
+            platform: linux
+            target: armv7
+            interpreter: 3.9 3.10 3.11 3.12 3.13 3.14
           - os: ubuntu
             platform: linux
             target: x86_64
@@ -40,6 +41,17 @@ jobs:
             platform: linux
             target: aarch64
             manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: armv7
+            manylinux: musllinux_1_1
+            interpreter: 3.9 3.10 3.11 3.12 3.13 3.14
+          - os: macos
+            target: x86_64
+            interpreter: pypy3.9 pypy3.10 pypy3.11
+          - os: macos
+            target: aarch64
+            interpreter: pypy3.9 pypy3.10 pypy3.11
     runs-on: ${{ matrix.os }}-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +77,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-13, macos-14]
         manylinux: [auto]
-        interpreter: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.13t"]
+        interpreter: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t"]
         include:
           - os: ubuntu-latest
             platform: linux
@@ -102,7 +114,7 @@ jobs:
         run: |
           uv python install ${{ env.UV_PYTHON }}
           uv venv .venv
-          uv pip install pytest pytest-asyncio
+          uv sync --no-install-project --group test
           uv pip install rloop --no-index --no-deps --find-links pgo_wheel --force-reinstall
           LLVM_PROFILE_FILE=${{ github.workspace }}/profdata/rlp_%m_%p.profraw uv run --no-sync pytest tests
       - name: merge PGO data
