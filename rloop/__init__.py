@@ -1,5 +1,4 @@
-from asyncio.events import BaseDefaultEventLoopPolicy as __BasePolicy
-
+from ._compat import _BaseEventLoopPolicy as __BasePolicy
 from ._rloop import __version__ as __version__
 from .loop import RLoop
 

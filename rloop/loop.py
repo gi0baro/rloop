@@ -391,7 +391,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                 exceptions = [exc for sub in exceptions for exc in sub]
                 try:
                     if all_errors:
-                        raise ExceptionGroup('create_connection failed', exceptions)
+                        raise ExceptionGroup('create_connection failed', exceptions)  # noqa: F821
                     if len(exceptions) == 1:
                         raise exceptions[0]
                     else:
