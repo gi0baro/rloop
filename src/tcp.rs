@@ -3,10 +3,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 
 use anyhow::Result;
 use mio::{
-    net::{TcpListener, TcpStream},
     Interest,
+    net::{TcpListener, TcpStream},
 };
-use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt};
+use pyo3::{IntoPyObjectExt, buffer::PyBuffer, prelude::*, types::PyBytes};
 use std::{
     borrow::Cow,
     cell::RefCell,

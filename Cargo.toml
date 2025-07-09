@@ -4,7 +4,7 @@ version = "0.1.4"
 description = "An asyncio event loop implemented in Rust"
 authors = ["Giovanni Barillari <g@baro.dev>"]
 license = "BSD-3-Clause"
-edition = "2021"
+edition = "2024"
 
 keywords = ["asyncio"]
 
@@ -27,14 +27,14 @@ include = [
 
 [lib]
 name = "_rloop"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "=1.0"
 mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
 papaya = "=0.2"
 pyo3 = { version = "=0.25", features = ["anyhow", "extension-module", "generate-import-lib"] }
-socket2 = { version = "=0.5", features = ["all"] }
+socket2 = { version = "=0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.159"

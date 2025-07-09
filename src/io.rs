@@ -5,7 +5,7 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::RawSocket;
 
-use mio::{event::Source as MioSource, net::TcpListener, Interest, Registry, Token};
+use mio::{Interest, Registry, Token, event::Source as MioSource, net::TcpListener};
 
 pub(crate) enum Source {
     TCPListener(TcpListener),

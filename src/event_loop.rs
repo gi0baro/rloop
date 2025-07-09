@@ -3,23 +3,23 @@ use std::{
     io::Read,
     mem,
     os::fd::{AsRawFd, FromRawFd},
-    sync::{atomic, Mutex, RwLock},
+    sync::{Mutex, RwLock, atomic},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use mio::{event, net::TcpListener, Interest, Poll, Token};
+use mio::{Interest, Poll, Token, event, net::TcpListener};
 use pyo3::prelude::*;
 
 use crate::{
     handles::{BoxedHandle, CBHandle, Handle, TimerHandle},
     io::Source,
-    log::{log_exc_to_py_ctx, LogExc},
+    log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
-    utils::{py_allow_threads, syscall},
+    utils::syscall,
 };
 
 const WAKEB: &[u8; 1] = b"\0";
@@ -164,7 +164,7 @@ impl EventLoop {
                 if idle_swap {
                     self.idle.store(true, atomic::Ordering::Release);
                 }
-                let res = py_allow_threads!(py, {
+                let res = py.allow_threads(|| {
                     let mut io = self.io.lock().unwrap();
                     let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
                     if idle_swap {
