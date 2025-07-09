@@ -10,7 +10,7 @@ use crate::{
 #[cfg(not(PyPy))]
 use crate::py::run_in_ctx1;
 
-pub(crate) trait Handle {
+pub trait Handle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState);
     fn cancelled(&self) -> bool {
         false

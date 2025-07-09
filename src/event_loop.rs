@@ -43,7 +43,7 @@ struct TCPListenerHandleData {
     server: TCPServerRef,
 }
 
-pub(crate) struct EventLoopRunState {
+pub struct EventLoopRunState {
     buf: Box<[u8]>,
     events: event::Events,
     pub read_buf: Box<[u8]>,
@@ -624,6 +624,41 @@ impl EventLoop {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
+        }
+        if self.idle.load(atomic::Ordering::Acquire) {
+            self.wake();
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn schedule_handle(&self, handle: impl Handle + Send + 'static, delay: Option<Duration>) -> Result<()> {
+        match delay {
+            Some(delay) => {
+                let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+                let timer = Timer {
+                    handle: Box::new(handle),
+                    when,
+                };
+                {
+                    let mut guard = self
+                        .handles_sched
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
+                    guard.push(timer);
+                }
+            }
+            None => {
+                {
+                    let mut guard = self
+                        .handles_ready
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
+                    guard.push_back(Box::new(handle));
+                }
+                self.counter_ready.fetch_add(1, atomic::Ordering::Release);
+            }
         }
         if self.idle.load(atomic::Ordering::Acquire) {
             self.wake();

@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use std::sync::OnceLock;
 
 pub mod event_loop;
-mod handles;
+pub mod handles;
 mod io;
 mod log;
 mod py;
