@@ -1167,10 +1167,11 @@ impl EventLoop {
                 break;
             }
             if let Err(err) = self.step(py, &mut state) {
-                if err.kind() == std::io::ErrorKind::Interrupted
-                    && self.sig_loop_handled.swap(false, atomic::Ordering::Relaxed)
-                {
-                    continue;
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    if self.sig_loop_handled.swap(false, atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    break;
                 }
                 self.run_post(&mut state);
                 return Err(err.into());
