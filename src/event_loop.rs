@@ -3,12 +3,12 @@ use std::{
     io::Read,
     mem,
     os::fd::{AsRawFd, FromRawFd},
-    sync::{Mutex, RwLock, atomic},
+    sync::{Arc, Mutex, RwLock, atomic},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use mio::{Interest, Poll, Token, event, net::TcpListener};
+use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
 use crate::{
@@ -19,13 +19,9 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
-    utils::syscall,
 };
 
-const WAKEB: &[u8; 1] = b"\0";
-
 enum IOHandle {
-    Internal,
     Py(PyHandleData),
     Signals,
     TCPListener(TCPListenerHandleData),
@@ -47,7 +43,6 @@ pub struct EventLoopRunState {
     buf: Box<[u8]>,
     events: event::Events,
     pub read_buf: Box<[u8]>,
-    sock: socket2::Socket,
     tick_last: u128,
 }
 
@@ -55,14 +50,13 @@ pub struct EventLoopRunState {
 pub struct EventLoop {
     idle: atomic::AtomicBool,
     io: Mutex<Poll>,
+    waker: Arc<Waker>,
     handles_io: papaya::HashMap<Token, IOHandle>,
     handles_ready: Mutex<VecDeque<BoxedHandle>>,
     handles_sched: Mutex<BinaryHeap<Timer>>,
     epoch: Instant,
     counter_ready: atomic::AtomicUsize,
     ssock: RwLock<Option<(socket2::Socket, socket2::Socket)>>,
-    wsock: Mutex<Option<socket2::Socket>>,
-    wsock_fd: atomic::AtomicI32,
     closed: atomic::AtomicBool,
     exc_handler: RwLock<PyObject>,
     exception_handler: RwLock<PyObject>,
@@ -88,46 +82,6 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    fn run_pre(&self) -> Result<EventLoopRunState> {
-        // wake sockets
-        let (sock_r, sock_w) = socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-        sock_r.set_nonblocking(true)?;
-        sock_w.set_nonblocking(true)?;
-        let token = Token(sock_r.as_raw_fd() as usize);
-        let mut source = Source::FD(sock_r.as_raw_fd());
-        {
-            let guard = self.io.lock().unwrap();
-            guard.registry().register(&mut source, token, Interest::READABLE)?;
-        }
-        self.handles_io.pin().insert(token, IOHandle::Internal);
-        {
-            let mut guard = self.wsock.lock().unwrap();
-            self.wsock_fd.store(sock_w.as_raw_fd(), atomic::Ordering::Relaxed);
-            *guard = Some(sock_w);
-        }
-
-        Ok(EventLoopRunState {
-            buf: vec![0; 4096].into_boxed_slice(),
-            events: event::Events::with_capacity(128),
-            read_buf: vec![0; 262_144].into_boxed_slice(),
-            tick_last: 0,
-            sock: sock_r,
-        })
-    }
-
-    fn run_post(&self, state: &mut EventLoopRunState) {
-        // cleanup wake sockets
-        self.wsock.lock().unwrap().take();
-        self.wsock_fd.store(-1, atomic::Ordering::Relaxed);
-        let token = Token(state.sock.as_raw_fd() as usize);
-        let mut source = Source::FD(state.sock.as_raw_fd());
-        {
-            let guard = self.io.lock().unwrap();
-            _ = guard.registry().deregister(&mut source);
-        }
-        self.handles_io.pin().remove(&token);
-    }
-
     #[inline]
     fn step(&self, py: Python, state: &mut EventLoopRunState) -> std::result::Result<(), std::io::Error> {
         let mut sched_time: Option<u64> = None;
@@ -154,33 +108,29 @@ impl EventLoop {
         }
 
         // I/O
-        let poll_result = match skip_poll {
-            true => {
-                state.events.clear();
-                Ok(())
+        let poll_result = if skip_poll {
+            Ok(())
+        } else {
+            let idle_swap = !matches!(sched_time, Some(0));
+            if idle_swap {
+                self.idle.store(true, atomic::Ordering::Release);
             }
-            false => {
-                let idle_swap = !matches!(sched_time, Some(0));
+            let res = py.allow_threads(|| {
+                let mut io = self.io.lock().unwrap();
+                let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
                 if idle_swap {
-                    self.idle.store(true, atomic::Ordering::Release);
+                    self.idle.store(false, atomic::Ordering::Release);
                 }
-                let res = py.allow_threads(|| {
-                    let mut io = self.io.lock().unwrap();
-                    let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
-                    if idle_swap {
-                        self.idle.store(false, atomic::Ordering::Release);
+                if let Err(ref err) = res {
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        // if we got an interrupt, we retry ready events (as we might need to process signals)
+                        let _ = io.poll(&mut state.events, Some(Duration::from_millis(0)));
                     }
-                    if let Err(ref err) = res {
-                        if err.kind() == std::io::ErrorKind::Interrupted {
-                            // if we got an interrupt, we retry ready events (as we might need to process signals)
-                            let _ = io.poll(&mut state.events, Some(Duration::from_millis(0)));
-                        }
-                    }
-                    res
-                });
-                state.tick_last = Instant::now().duration_since(self.epoch).as_micros();
+                }
                 res
-            }
+            });
+            state.tick_last = Instant::now().duration_since(self.epoch).as_micros();
+            res
         };
 
         let mut cb_handles = {
@@ -190,7 +140,7 @@ impl EventLoop {
         self.counter_ready
             .fetch_sub(cb_handles.len(), atomic::Ordering::Release);
 
-        {
+        if !skip_poll {
             let io_handles = self.handles_io.pin();
             for event in &state.events {
                 // NOTE: cancellation is not necessary as we have custom futures
@@ -199,7 +149,6 @@ impl EventLoop {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
-                        IOHandle::Internal => self.handle_io_internal(&mut state.sock, &mut state.buf),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
                 }
@@ -243,11 +192,6 @@ impl EventLoop {
             }
         }
         len
-    }
-
-    #[inline]
-    fn handle_io_internal(&self, socket: &mut socket2::Socket, buf: &mut [u8]) {
-        self.read_from_sock(socket, buf);
     }
 
     #[inline]
@@ -338,8 +282,9 @@ impl EventLoop {
 
     #[inline(always)]
     fn wake(&self) {
-        let fd = self.wsock_fd.load(atomic::Ordering::Relaxed);
-        _ = syscall!(write(fd, WAKEB.as_ptr().cast(), 1));
+        if self.idle.load(atomic::Ordering::Acquire) {
+            _ = self.waker.wake();
+        }
     }
 
     pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
@@ -486,9 +431,7 @@ impl EventLoop {
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -509,9 +452,7 @@ impl EventLoop {
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -532,9 +473,7 @@ impl EventLoop {
             guard.push_back(Box::new(handle));
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -559,9 +498,7 @@ impl EventLoop {
                 .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -592,9 +529,7 @@ impl EventLoop {
                 .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -625,9 +560,7 @@ impl EventLoop {
                 .map_err(|_| anyhow::anyhow!("lock acquisition failed"))?;
             guard.push(timer);
         }
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -660,9 +593,7 @@ impl EventLoop {
                 self.counter_ready.fetch_add(1, atomic::Ordering::Release);
             }
         }
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         Ok(())
     }
@@ -672,17 +603,19 @@ impl EventLoop {
 impl EventLoop {
     #[new]
     fn new(py: Python) -> PyResult<Self> {
+        let poll = Poll::new()?;
+        let waker = Waker::new(poll.registry(), Token(0))?;
+
         Ok(Self {
             idle: atomic::AtomicBool::new(false),
-            io: Mutex::new(Poll::new()?),
+            io: Mutex::new(poll),
+            waker: Arc::new(waker),
             handles_io: papaya::HashMap::with_capacity(128),
             handles_ready: Mutex::new(VecDeque::with_capacity(128)),
             handles_sched: Mutex::new(BinaryHeap::with_capacity(32)),
             epoch: Instant::now(),
             counter_ready: atomic::AtomicUsize::new(0),
             ssock: RwLock::new(None),
-            wsock: Mutex::new(None),
-            wsock_fd: atomic::AtomicI32::new(-1),
             closed: atomic::AtomicBool::new(false),
             exc_handler: RwLock::new(py.None()),
             exception_handler: RwLock::new(py.None()),
@@ -935,10 +868,7 @@ impl EventLoop {
             guard.push_back(bhandle);
         }
         self.counter_ready.fetch_add(1, atomic::Ordering::Release);
-        // wake when necessary
-        if self.idle.load(atomic::Ordering::Acquire) {
-            self.wake();
-        }
+        self.wake();
 
         handle
     }
@@ -1195,7 +1125,12 @@ impl EventLoop {
     }
 
     fn _run(&self, py: Python) -> PyResult<()> {
-        let mut state = self.run_pre()?;
+        let mut state = EventLoopRunState {
+            buf: vec![0; 4096].into_boxed_slice(),
+            events: event::Events::with_capacity(128),
+            read_buf: vec![0; 262_144].into_boxed_slice(),
+            tick_last: 0,
+        };
 
         loop {
             if self.stopping.load(atomic::Ordering::Acquire) {
@@ -1208,12 +1143,10 @@ impl EventLoop {
                     }
                     break;
                 }
-                self.run_post(&mut state);
                 return Err(err.into());
             }
         }
 
-        self.run_post(&mut state);
         Ok(())
     }
 }
