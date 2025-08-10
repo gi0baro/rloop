@@ -1,3 +1,6 @@
+import threading
+
+
 def run_loop(loop):
     async def run():
         loop.stop()
@@ -57,3 +60,39 @@ def test_call_at(loop):
     dt = loop.time() - t0
 
     assert dt >= delay
+
+
+def test_call_soon_threadsafe(loop):
+    calls = []
+
+    def cb(arg):
+        calls.append(arg)
+
+    def wake(cond):
+        with cond:
+            cond.notify_all()
+
+    def stop():
+        loop.stop()
+
+    def trun(cond1, cond2, loop, cb):
+        with cond1:
+            cond1.wait()
+        loop.call_soon_threadsafe(cb, 2)
+        with cond2:
+            cond2.wait()
+        loop.call_soon_threadsafe(cb, 4)
+
+    cond1 = threading.Condition()
+    cond2 = threading.Condition()
+    t = threading.Thread(target=trun, args=(cond1, cond2, loop, cb))
+    t.start()
+
+    loop.call_soon(cb, 1)
+    loop.call_soon(wake, cond1)
+    loop.call_later(0.5, cb, 3)
+    loop.call_later(0.6, wake, cond2)
+    loop.call_later(1.0, stop)
+    loop.run_forever()
+
+    assert calls == [1, 2, 3, 4]
