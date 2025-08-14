@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
+use mio::{Interest, Poll, Token, Waker, event, net::TcpListener, unix::SourceFd};
 use pyo3::prelude::*;
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
     py::{copy_context, weakset},
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
+    udp::{UDPHandle, UDPTransport},
     time::Timer,
 };
 
@@ -26,6 +27,7 @@ enum IOHandle {
     Signals,
     TCPListener(TCPListenerHandleData),
     TCPStream(Interest),
+    UDPSocket,
 }
 
 struct PyHandleData {
@@ -73,6 +75,7 @@ pub struct EventLoop {
     task_factory: RwLock<PyObject>,
     tcp_lstreams: papaya::HashMap<usize, papaya::HashSet<usize>>,
     tcp_transports: papaya::HashMap<usize, Py<TCPTransport>>,
+    udp_transports: papaya::HashMap<usize, Py<UDPTransport>>,
     thread_id: atomic::AtomicI64,
     watcher_child: RwLock<PyObject>,
     #[pyo3(get)]
@@ -149,6 +152,7 @@ impl EventLoop {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
+                        IOHandle::UDPSocket => self.handle_io_udp(event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
                 }
@@ -251,6 +255,14 @@ impl EventLoop {
             handles_ready.push_back(Box::new(TCPReadHandle { fd }));
         } else if event.is_writable() {
             handles_ready.push_back(Box::new(TCPWriteHandle { fd }));
+        }
+    }
+
+    #[inline]
+    fn handle_io_udp(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
+        let fd = event.token().0;
+        if event.is_readable() {
+            handles_ready.push_back(Box::new(UDPHandle::new(fd)));
         }
     }
 
@@ -401,6 +413,36 @@ impl EventLoop {
         if let Some(streams_ref) = self.tcp_lstreams.pin().get(&fd) {
             func(streams_ref);
         }
+    }
+
+    // UDP socket management methods
+    #[inline]
+    pub(crate) fn udp_socket_add(&self, fd: usize, socket: mio::net::UdpSocket) {
+        let token = Token(fd);
+        let io = self.io.lock().unwrap();
+        io.registry().register(&mut SourceFd(&socket.as_raw_fd()), token, Interest::READABLE).unwrap();
+        std::mem::forget(socket); // Keep socket alive
+        self.handles_io.pin().insert(token, IOHandle::UDPSocket);
+    }
+
+    #[inline]
+    pub(crate) fn udp_socket_rem(&self, fd: usize) {
+        let token = Token(fd);
+        if let Some(_) = self.handles_io.pin().remove(&token) {
+            let io = self.io.lock().unwrap();
+            let _ = io.registry().deregister(&mut SourceFd(&(fd as i32)));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn udp_socket_close(&self, _py: Python, fd: usize) {
+        self.udp_socket_rem(fd);
+        self.udp_transports.pin().remove(&fd);
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_udp_transport(&self, fd: usize, py: Python) -> Py<UDPTransport> {
+        self.udp_transports.pin().get(&fd).unwrap().clone_ref(py)
     }
 
     pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {
@@ -631,6 +673,7 @@ impl EventLoop {
             task_factory: RwLock::new(py.None()),
             tcp_lstreams: papaya::HashMap::with_capacity(32),
             tcp_transports: papaya::HashMap::with_capacity(1024),
+            udp_transports: papaya::HashMap::with_capacity(1024),
             thread_id: atomic::AtomicI64::new(0),
             watcher_child: RwLock::new(py.None()),
             _asyncgens: weakset(py)?.unbind(),
@@ -1108,6 +1151,42 @@ impl EventLoop {
 
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         self.tcp_transports.pin().contains_key(&fd)
+    }
+
+    fn _udp_conn(
+        pyself: Py<Self>,
+        py: Python,
+        sock: (i32, i32),
+        protocol_factory: PyObject,
+        remote_addr: Option<PyObject>,
+    ) -> PyResult<(Py<UDPTransport>, PyObject)> {
+        use std::net::SocketAddr;
+        
+        let parsed_remote_addr = match remote_addr {
+            Some(addr_obj) => {
+                let addr_tuple: (String, u16) = addr_obj.extract(py)?;
+                Some(format!("{}:{}", addr_tuple.0, addr_tuple.1).parse::<SocketAddr>()
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid remote address: {}", e)))?)
+            },
+            None => None,
+        };
+
+        let rself = pyself.get();
+        let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, parsed_remote_addr);
+        let fd = transport.fd;
+        let pytransport = Py::new(py, transport)?;
+        let proto = UDPTransport::attach(&pytransport, py)?;
+        rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
+        
+        // Get the socket for registration
+        let socket_fd = sock.0;
+        let socket = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
+        let _ = socket.set_nonblocking(true);
+        let std_socket: std::net::UdpSocket = socket.into();
+        let mio_socket = mio::net::UdpSocket::from_std(std_socket);
+        
+        rself.udp_socket_add(fd, mio_socket);
+        Ok((pytransport, proto))
     }
 
     fn _sig_add(&self, py: Python, sig: u8, callback: PyObject, args: PyObject, context: PyObject) {
