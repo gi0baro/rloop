@@ -660,7 +660,56 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         allow_broadcast=None,
         sock=None,
     ):
-        raise NotImplementedError
+        if sock is None:
+            if not family and not local_addr and not remote_addr:
+                raise ValueError('Unexpected address family')
+
+            af = family or socket.AF_INET
+            if proto == 0:
+                if af == socket.AF_UNIX:
+                    proto = 0  # Unix sockets don't use IPPROTO_UDP
+                else:
+                    proto = socket.IPPROTO_UDP
+
+            # Create the socket
+            sock = socket.socket(af, socket.SOCK_DGRAM, proto)
+            try:
+                if reuse_address:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if reuse_port:
+                    _set_reuseport(sock)
+                if allow_broadcast:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+                sock.setblocking(False)
+
+                if local_addr:
+                    sock.bind(local_addr)
+                if remote_addr:
+                    sock.connect(remote_addr)
+
+            except OSError:
+                sock.close()
+                raise
+        else:
+            if not hasattr(sock, 'family') or not hasattr(sock, 'type'):
+                raise TypeError('sock must be a socket')
+            if sock.type != socket.SOCK_DGRAM:
+                raise ValueError('sock must be a datagram socket')
+            if sock.gettimeout() != 0.0:
+                raise ValueError('sock must be non-blocking')
+
+        # Create the transport
+        transport, protocol = self._udp_conn(
+            (sock.fileno(), sock.family),
+            protocol_factory,
+            remote_addr
+        )
+
+        # sock is now owned by the transport, prevent close
+        sock.detach()
+
+        return transport, protocol
 
     #: pipes and subprocesses methods
     async def connect_read_pipe(self, protocol_factory, pipe):
