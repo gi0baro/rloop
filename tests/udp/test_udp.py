@@ -40,9 +40,7 @@ def test_create_datagram_endpoint_sock(loop):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('127.0.0.1', 0))
     sock.setblocking(False)  # Make socket non-blocking
-    fut = loop.create_datagram_endpoint(
-        lambda: DatagramProto(create_future=True, loop=loop),
-        sock=sock)
+    fut = loop.create_datagram_endpoint(lambda: DatagramProto(create_future=True, loop=loop), sock=sock)
     transport, protocol = loop.run_until_complete(fut)
     transport.close()
     loop.run_until_complete(protocol.done)
@@ -51,9 +49,7 @@ def test_create_datagram_endpoint_sock(loop):
 
 @pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'), reason='no UDS')
 def test_create_datagram_endpoint_sock_unix(loop):
-    fut = loop.create_datagram_endpoint(
-        lambda: DatagramProto(create_future=True, loop=loop),
-        family=socket.AF_UNIX)
+    fut = loop.create_datagram_endpoint(lambda: DatagramProto(create_future=True, loop=loop), family=socket.AF_UNIX)
     transport, protocol = loop.run_until_complete(fut)
     # Check that the socket family is AF_UNIX using get_extra_info
     sock_info = transport.get_extra_info('socket')
@@ -65,8 +61,8 @@ def test_create_datagram_endpoint_sock_unix(loop):
 
 def test_create_datagram_endpoint_local_addr(loop):
     fut = loop.create_datagram_endpoint(
-        lambda: DatagramProto(create_future=True, loop=loop),
-        local_addr=('127.0.0.1', 0))
+        lambda: DatagramProto(create_future=True, loop=loop), local_addr=('127.0.0.1', 0)
+    )
     transport, protocol = loop.run_until_complete(fut)
     transport.close()
     loop.run_until_complete(protocol.done)
@@ -75,8 +71,8 @@ def test_create_datagram_endpoint_local_addr(loop):
 
 def test_create_datagram_endpoint_remote_addr(loop):
     fut = loop.create_datagram_endpoint(
-        lambda: DatagramProto(create_future=True, loop=loop),
-        remote_addr=('127.0.0.1', 12345))
+        lambda: DatagramProto(create_future=True, loop=loop), remote_addr=('127.0.0.1', 12345)
+    )
     transport, protocol = loop.run_until_complete(fut)
     transport.close()
     loop.run_until_complete(protocol.done)

@@ -18,8 +18,8 @@ use crate::{
     py::{copy_context, weakset},
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
-    udp::{UDPHandle, UDPTransport},
     time::Timer,
+    udp::{UDPHandle, UDPTransport},
 };
 
 enum IOHandle {
@@ -420,7 +420,9 @@ impl EventLoop {
     pub(crate) fn udp_socket_add(&self, fd: usize, socket: mio::net::UdpSocket) {
         let token = Token(fd);
         let io = self.io.lock().unwrap();
-        io.registry().register(&mut SourceFd(&socket.as_raw_fd()), token, Interest::READABLE).unwrap();
+        io.registry()
+            .register(&mut SourceFd(&socket.as_raw_fd()), token, Interest::READABLE)
+            .unwrap();
         std::mem::forget(socket); // Keep socket alive
         self.handles_io.pin().insert(token, IOHandle::UDPSocket);
     }
@@ -428,8 +430,9 @@ impl EventLoop {
     #[inline]
     pub(crate) fn udp_socket_rem(&self, fd: usize) {
         let token = Token(fd);
-        if let Some(_) = self.handles_io.pin().remove(&token) {
+        if self.handles_io.pin().remove(&token).is_some() {
             let io = self.io.lock().unwrap();
+            #[allow(clippy::cast_possible_wrap)]
             let _ = io.registry().deregister(&mut SourceFd(&(fd as i32)));
         }
     }
@@ -1161,13 +1164,16 @@ impl EventLoop {
         remote_addr: Option<PyObject>,
     ) -> PyResult<(Py<UDPTransport>, PyObject)> {
         use std::net::SocketAddr;
-        
+
         let parsed_remote_addr = match remote_addr {
             Some(addr_obj) => {
                 let addr_tuple: (String, u16) = addr_obj.extract(py)?;
-                Some(format!("{}:{}", addr_tuple.0, addr_tuple.1).parse::<SocketAddr>()
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid remote address: {}", e)))?)
-            },
+                Some(
+                    format!("{}:{}", addr_tuple.0, addr_tuple.1)
+                        .parse::<SocketAddr>()
+                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid remote address: {e}")))?,
+                )
+            }
             None => None,
         };
 
@@ -1177,14 +1183,14 @@ impl EventLoop {
         let pytransport = Py::new(py, transport)?;
         let proto = UDPTransport::attach(&pytransport, py)?;
         rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
-        
+
         // Get the socket for registration
         let socket_fd = sock.0;
         let socket = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
         let _ = socket.set_nonblocking(true);
         let std_socket: std::net::UdpSocket = socket.into();
         let mio_socket = mio::net::UdpSocket::from_std(std_socket);
-        
+
         rself.udp_socket_add(fd, mio_socket);
         Ok((pytransport, proto))
     }

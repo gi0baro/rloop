@@ -700,11 +700,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                 raise ValueError('sock must be non-blocking')
 
         # Create the transport
-        transport, protocol = self._udp_conn(
-            (sock.fileno(), sock.family),
-            protocol_factory,
-            remote_addr
-        )
+        transport, protocol = self._udp_conn((sock.fileno(), sock.family), protocol_factory, remote_addr)
 
         # sock is now owned by the transport, prevent close
         sock.detach()
