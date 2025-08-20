@@ -816,22 +816,22 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         try:
             n = sock.send(data)
         except (BlockingIOError, InterruptedError):
-            pass
-        else:
-            if n == len(data):
-                return
-            data = memoryview(data)
-            data = data[n:]
+            n = 0
+
+        if n == len(data):
+            return
 
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
         future = _SyncSockWriterFuture(sock, self)
-        self.add_writer(fd, self._sock_sendall, future, sock, data)
+        self.add_writer(fd, self._sock_sendall, future, sock, memoryview(data), [n])
         return await future
 
-    def _sock_sendall(self, fut, sock, data):
+    def _sock_sendall(self, fut, sock, data, pos):
+        start = pos[0]
+
         try:
-            n = sock.send(data)
+            n = sock.send(data[start:])
         except (BlockingIOError, InterruptedError):
             return
         except (SystemExit, KeyboardInterrupt):
@@ -841,12 +841,13 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             self.remove_writer(sock.fileno())
             return
 
-        self.remove_writer(sock.fileno())
-        if n == len(data):
+        start += n
+
+        if start == len(data):
             fut.set_result(None)
+            self.remove_writer(sock.fileno())
         else:
-            data = data[n:]
-            self.add_writer(sock.fileno(), self._sock_sendall, fut, sock, data)
+            pos[0] = start
 
     # async def sock_sendto(self, sock, data, address):
     #     raise NotImplementedError
