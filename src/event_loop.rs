@@ -121,11 +121,11 @@ impl EventLoop {
                 if idle_swap {
                     self.idle.store(false, atomic::Ordering::Release);
                 }
-                if let Err(ref err) = res {
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        // if we got an interrupt, we retry ready events (as we might need to process signals)
-                        let _ = io.poll(&mut state.events, Some(Duration::from_millis(0)));
-                    }
+                if let Err(ref err) = res
+                    && err.kind() == std::io::ErrorKind::Interrupted
+                {
+                    // if we got an interrupt, we retry ready events (as we might need to process signals)
+                    let _ = io.poll(&mut state.events, Some(Duration::from_millis(0)));
                 }
                 res
             });
@@ -202,15 +202,15 @@ impl EventLoop {
         handle: &PyHandleData,
         handles: &mut VecDeque<BoxedHandle>,
     ) {
-        if let Some(cbr) = &handle.cbr {
-            if event.is_readable() {
-                handles.push_back(Box::new(cbr.clone_ref(py)));
-            }
+        if let Some(cbr) = &handle.cbr
+            && event.is_readable()
+        {
+            handles.push_back(Box::new(cbr.clone_ref(py)));
         }
-        if let Some(cbw) = &handle.cbw {
-            if event.is_writable() {
-                handles.push_back(Box::new(cbw.clone_ref(py)));
-            }
+        if let Some(cbw) = &handle.cbw
+            && event.is_writable()
+        {
+            handles.push_back(Box::new(cbw.clone_ref(py)));
         }
     }
 
@@ -382,11 +382,10 @@ impl EventLoop {
 
     #[inline(always)]
     pub(crate) fn tcp_stream_close(&self, py: Python, fd: usize) {
-        if let Some(transport) = self.tcp_transports.pin().remove(&fd) {
-            if let Some(lfd) = transport.borrow(py).lfd {
-                self.tcp_lstreams.pin().get(&lfd).map(|v| v.pin().remove(&fd));
-            }
-            // transport.drop_ref(py);
+        if let Some(transport) = self.tcp_transports.pin().remove(&fd)
+            && let Some(lfd) = transport.borrow(py).lfd
+        {
+            self.tcp_lstreams.pin().get(&lfd).map(|v| v.pin().remove(&fd));
         }
     }
 

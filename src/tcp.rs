@@ -605,10 +605,10 @@ impl TCPReadHandle {
     #[inline]
     fn recv_eof(&self, py: Python, event_loop: &EventLoop, transport: &TCPTransport) -> bool {
         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-        if let Ok(pyr) = transport.proto.call_method0(py, pyo3::intern!(py, "eof_received")) {
-            if let Ok(true) = pyr.is_truthy(py) {
-                return false;
-            }
+        if let Ok(pyr) = transport.proto.call_method0(py, pyo3::intern!(py, "eof_received"))
+            && let Ok(true) = pyr.is_truthy(py)
+        {
+            return false;
         }
         transport.close_from_read_handle(py, event_loop)
     }

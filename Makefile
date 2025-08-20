@@ -45,7 +45,8 @@ lint-rust:
 		-A clippy::upper-case-acronyms \
 		-A clippy::used-underscore-binding \
 		-A clippy::used-underscore-items \
-		-A clippy::wrong-self-convention
+		-A clippy::wrong-self-convention \
+		-A mismatched-lifetime-syntaxes
 
 .PHONY: lint
 lint: lint-python lint-rust
