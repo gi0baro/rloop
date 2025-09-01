@@ -54,7 +54,7 @@ jobs:
             interpreter: pypy3.9 pypy3.10 pypy3.11
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pyo3/maturin-action@v1
         with:
           rust-toolchain: stable
@@ -86,7 +86,7 @@ jobs:
     env:
       UV_PYTHON: ${{ matrix.interpreter }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
