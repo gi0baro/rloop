@@ -655,56 +655,78 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         family=0,
         proto=0,
         flags=0,
-        reuse_address=None,
+        #: not in stdlib
+        # reuse_address=None,
         reuse_port=None,
         allow_broadcast=None,
         sock=None,
     ):
-        if sock is None:
-            if not family and not local_addr and not remote_addr:
-                raise ValueError('Unexpected address family')
+        if sock is not None:
+            if getattr(sock, 'type', None) != socket.SOCK_DGRAM:
+                raise ValueError(f'A datagram socket was expected, got {sock!r}')
+            if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
+                raise ValueError('socket modifier keyword arguments can not be used when sock is specified.')
+            sock.setblocking(False)
+            r_addr = None
+        else:
+            if not (local_addr or remote_addr):
+                if family == 0:
+                    raise ValueError('unexpected address family')
+                addr_info = (family, proto, None, None)
+            elif hasattr(socket, 'AF_UNIX') and family == socket.AF_UNIX:
+                for addr in (local_addr, remote_addr):
+                    if addr is not None and not isinstance(addr, str):
+                        raise TypeError('string is expected')
+                addr_info = (family, proto, local_addr, remote_addr)
+            else:
+                addr_info, infos = None, None
+                for addr in (local_addr, remote_addr):
+                    if addr is None:
+                        continue
+                    if not (isinstance(addr, tuple) and len(addr) == 2):
+                        raise TypeError('2-tuple is expected')
+                    infos = await self._ensure_resolved(
+                        addr, family=family, type=socket.SOCK_DGRAM, proto=proto, flags=flags
+                    )
+                    break
 
-            af = family or socket.AF_INET
-            if proto == 0:
-                if af == socket.AF_UNIX:
-                    proto = 0  # Unix sockets don't use IPPROTO_UDP
-                else:
-                    proto = socket.IPPROTO_UDP
+                if not infos:
+                    raise OSError('getaddrinfo() returned empty list')
+                if local_addr is not None:
+                    addr_info = (infos[0], infos[2], infos[4], None)
+                if remote_addr is not None:
+                    addr_info = (infos[0], infos[2], None, infos[4])
+                if not addr_info:
+                    raise ValueError('can not get address information')
 
-            # Create the socket
-            sock = socket.socket(af, socket.SOCK_DGRAM, proto)
+            sock = None
+            r_addr = None
+            sfam, spro, sladdr, sraddr = addr_info
             try:
-                if reuse_address:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock = socket.socket(family=sfam, type=socket.SOCK_DGRAM, proto=spro)
+                #: not in stdlib
+                # if reuse_address:
+                #     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if reuse_port:
                     _set_reuseport(sock)
                 if allow_broadcast:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
                 sock.setblocking(False)
-
-                if local_addr:
-                    sock.bind(local_addr)
-                if remote_addr:
-                    sock.connect(remote_addr)
-
+                if sladdr:
+                    sock.bind(sladdr)
+                if sraddr:
+                    if not allow_broadcast:
+                        await self.sock_connect(sock, sraddr)
+                    r_addr = sraddr
             except OSError:
-                sock.close()
+                if sock is not None:
+                    sock.close()
                 raise
-        else:
-            if not hasattr(sock, 'family') or not hasattr(sock, 'type'):
-                raise TypeError('sock must be a socket')
-            if sock.type != socket.SOCK_DGRAM:
-                raise ValueError('sock must be a datagram socket')
-            if sock.gettimeout() != 0.0:
-                raise ValueError('sock must be non-blocking')
 
         # Create the transport
-        transport, protocol = self._udp_conn((sock.fileno(), sock.family), protocol_factory, remote_addr)
-
+        transport, protocol = self._udp_conn((sock.fileno(), sock.family), protocol_factory, r_addr)
         # sock is now owned by the transport, prevent close
         sock.detach()
-
         return transport, protocol
 
     #: pipes and subprocesses methods

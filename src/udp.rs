@@ -3,7 +3,15 @@ use std::os::fd::{AsRawFd, FromRawFd};
 
 use mio::net::UdpSocket;
 use pyo3::{IntoPyObject, prelude::*, types::PyBytes};
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, io::ErrorKind, net::SocketAddr, sync::atomic};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
+    io::ErrorKind,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::atomic,
+};
 
 use crate::{
     event_loop::{EventLoop, EventLoopRunState},
@@ -72,13 +80,14 @@ impl UDPTransport {
         pyloop: &Py<EventLoop>,
         pysock: (i32, i32),
         proto_factory: PyObject,
-        remote_addr: Option<SocketAddr>,
+        remote_addr_tup: Option<(String, u16)>,
     ) -> Self {
         let sock = unsafe { socket2::Socket::from_raw_fd(pysock.0) };
         _ = sock.set_nonblocking(true);
-        let std_socket: std::net::UdpSocket = sock.into();
-        let socket = UdpSocket::from_std(std_socket);
+        let stds: std::net::UdpSocket = sock.into();
+        let socket = UdpSocket::from_std(stds);
 
+        let remote_addr = remote_addr_tup.map(|v| SocketAddr::new(IpAddr::from_str(&v.0).unwrap(), v.1));
         let proto = proto_factory.bind(py).call0().unwrap();
 
         Self::new(py, pyloop.clone_ref(py), socket, proto, pysock.1, remote_addr)
@@ -92,7 +101,7 @@ impl UDPTransport {
         Ok(rself.proto.clone_ref(py))
     }
 
-    #[inline]
+    #[inline(always)]
     fn call_conn_lost(&self, py: Python, exc: Option<PyErr>) {
         _ = self.protom_conn_lost.call1(py, (exc,));
     }
@@ -141,13 +150,19 @@ impl UDPTransport {
             return;
         }
 
-        let event_loop = self.pyloop.get();
-        event_loop.udp_socket_rem(self.fd);
+        self.pyloop.get().udp_socket_rem(self.fd);
         self.call_conn_lost(py, None);
     }
 
     fn abort(&self, py: Python) {
-        self.close(py);
+        if self
+            .closing
+            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+            .is_ok()
+        {
+            self.pyloop.get().udp_socket_rem(self.fd);
+        }
+        self.call_conn_lost(py, None);
     }
 
     fn set_protocol(&self, _protocol: PyObject) -> PyResult<()> {
@@ -160,36 +175,24 @@ impl UDPTransport {
         self.proto.clone_ref(py)
     }
 
-    fn sendto(&self, py: Python, data: Cow<[u8]>, addr: Option<PyObject>) -> PyResult<()> {
+    // TODO: implement buffered write
+    fn sendto(&self, data: Cow<[u8]>, addr: Option<(String, u16)>) -> PyResult<()> {
         if self.closing.load(atomic::Ordering::Relaxed) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Cannot send on closing transport",
             ));
         }
 
-        let target_addr = match addr {
-            Some(addr_obj) => {
-                // Parse the address from Python tuple (host, port)
-                let addr_tuple: (String, u16) = addr_obj.extract(py)?;
-                Some(
-                    format!("{}:{}", addr_tuple.0, addr_tuple.1)
-                        .parse::<SocketAddr>()
-                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {e}")))?,
-                )
-            }
-            None => {
-                // Get remote addr without holding the borrow longer than necessary
-                self.state.borrow().remote_addr
-            }
-        };
-
-        match target_addr {
+        match addr
+            .map(|v| SocketAddr::new(IpAddr::from_str(&v.0).unwrap(), v.1))
+            .or_else(|| self.state.borrow().remote_addr)
+        {
             Some(addr) => {
                 // Temporarily borrow just for the send operation
                 match self.state.borrow().socket.send_to(&data, addr) {
                     Ok(_) => Ok(()),
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        // For UDP, we don't buffer writes like TCP - just drop the packet or return error
+                        // FIXME: For UDP, we don't buffer writes like TCP - just drop the packet or return error
                         Err(pyo3::exceptions::PyBlockingIOError::new_err("Socket would block"))
                     }
                     Err(err) => Err(pyo3::exceptions::PyOSError::new_err(err.to_string())),
@@ -200,36 +203,30 @@ impl UDPTransport {
     }
 }
 
-pub(crate) struct UDPHandle {
+pub(crate) struct UDPReadHandle {
     fd: usize,
 }
 
-impl UDPHandle {
+impl UDPReadHandle {
     pub(crate) fn new(fd: usize) -> Self {
         Self { fd }
     }
 }
 
-impl Handle for UDPHandle {
-    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+impl Handle for UDPReadHandle {
+    fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
         let pytransport = event_loop.get_udp_transport(self.fd, py);
         let transport = pytransport.borrow(py);
 
-        // Read datagrams from the socket
-        let mut buf = vec![0u8; 65536].into_boxed_slice(); // Max UDP packet size
-
         loop {
-            // Limit the scope of the borrow
-            let recv_result = {
-                let state = transport.state.borrow();
-                state.socket.recv_from(&mut buf)
-            };
-
-            match recv_result {
+            match {
+                let trxstate = transport.state.borrow();
+                trxstate.socket.recv_from(&mut state.read_buf)
+            } {
                 Ok((size, addr)) => {
                     // Call the protocol's datagram_received method
                     // Now state is not borrowed, so sendto can work
-                    transport.call_datagram_received(py, &buf[..size], addr);
+                    transport.call_datagram_received(py, &state.read_buf[..size], addr);
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
                     // No more data available

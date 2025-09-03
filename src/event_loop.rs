@@ -8,7 +8,9 @@ use std::{
 };
 
 use anyhow::Result;
-use mio::{Interest, Poll, Token, Waker, event, net::TcpListener, unix::SourceFd};
+#[cfg(unix)]
+use mio::unix::SourceFd;
+use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
 use crate::{
@@ -19,7 +21,7 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
-    udp::{UDPHandle, UDPTransport},
+    udp::{UDPReadHandle, UDPTransport},
 };
 
 enum IOHandle {
@@ -262,7 +264,7 @@ impl EventLoop {
     fn handle_io_udp(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
         let fd = event.token().0;
         if event.is_readable() {
-            handles_ready.push_back(Box::new(UDPHandle::new(fd)));
+            handles_ready.push_back(Box::new(UDPReadHandle::new(fd)));
         }
     }
 
@@ -415,15 +417,13 @@ impl EventLoop {
         }
     }
 
-    // UDP socket management methods
     #[inline]
-    pub(crate) fn udp_socket_add(&self, fd: usize, socket: mio::net::UdpSocket) {
+    pub(crate) fn udp_socket_add(&self, fd: usize) {
         let token = Token(fd);
-        let io = self.io.lock().unwrap();
-        io.registry()
-            .register(&mut SourceFd(&socket.as_raw_fd()), token, Interest::READABLE)
-            .unwrap();
-        std::mem::forget(socket); // Keep socket alive
+        #[allow(clippy::cast_possible_wrap)]
+        let mut source = Source::UDPSocket(fd as i32);
+        let guard_poll = self.io.lock().unwrap();
+        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
         self.handles_io.pin().insert(token, IOHandle::UDPSocket);
     }
 
@@ -1161,37 +1161,15 @@ impl EventLoop {
         py: Python,
         sock: (i32, i32),
         protocol_factory: PyObject,
-        remote_addr: Option<PyObject>,
+        remote_addr: Option<(String, u16)>,
     ) -> PyResult<(Py<UDPTransport>, PyObject)> {
-        use std::net::SocketAddr;
-
-        let parsed_remote_addr = match remote_addr {
-            Some(addr_obj) => {
-                let addr_tuple: (String, u16) = addr_obj.extract(py)?;
-                Some(
-                    format!("{}:{}", addr_tuple.0, addr_tuple.1)
-                        .parse::<SocketAddr>()
-                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid remote address: {e}")))?,
-                )
-            }
-            None => None,
-        };
-
         let rself = pyself.get();
-        let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, parsed_remote_addr);
+        let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, remote_addr);
         let fd = transport.fd;
         let pytransport = Py::new(py, transport)?;
         let proto = UDPTransport::attach(&pytransport, py)?;
         rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
-
-        // Get the socket for registration
-        let socket_fd = sock.0;
-        let socket = unsafe { socket2::Socket::from_raw_fd(socket_fd) };
-        let _ = socket.set_nonblocking(true);
-        let std_socket: std::net::UdpSocket = socket.into();
-        let mio_socket = mio::net::UdpSocket::from_std(std_socket);
-
-        rself.udp_socket_add(fd, mio_socket);
+        rself.udp_socket_add(fd);
         Ok((pytransport, proto))
     }
 
