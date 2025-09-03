@@ -27,6 +27,7 @@ lint-rust:
 		-D warnings \
 		-W clippy::pedantic \
 		-W clippy::dbg_macro \
+		-A clippy::blocks_in_conditions \
 		-A clippy::cast-possible-truncation \
 		-A clippy::cast-sign-loss \
 		-A clippy::declare-interior-mutable-const \

@@ -693,9 +693,9 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                 if not infos:
                     raise OSError('getaddrinfo() returned empty list')
                 if local_addr is not None:
-                    addr_info = (infos[0], infos[2], infos[4], None)
+                    addr_info = (infos[0][0], infos[0][2], infos[0][4], None)
                 if remote_addr is not None:
-                    addr_info = (infos[0], infos[2], None, infos[4])
+                    addr_info = (infos[0][0], infos[0][2], None, infos[0][4])
                 if not addr_info:
                     raise ValueError('can not get address information')
 
