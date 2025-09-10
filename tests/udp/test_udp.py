@@ -1,9 +1,7 @@
 import asyncio
+import socket
 
-
-# import socket
-
-# import pytest
+import pytest
 
 
 class DatagramProto(asyncio.DatagramProtocol):
@@ -38,39 +36,44 @@ class DatagramProto(asyncio.DatagramProtocol):
             self.done.set_result(None)
 
 
-# def test_create_datagram_endpoint_sock(loop):
-#     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-#     sock.bind(('127.0.0.1', 0))
-#     fut = loop.create_datagram_endpoint(
-#         lambda: DatagramProto(create_future=True, loop=loop),
-#         sock=sock)
-#     transport, protocol = loop.run_until_complete(fut)
-#     transport.close()
-#     loop.run_until_complete(protocol.done)
-#     assert protocol.state == 'CLOSED'
+def test_create_datagram_endpoint_sock(loop):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('127.0.0.1', 0))
+    sock.setblocking(False)  # Make socket non-blocking
+    fut = loop.create_datagram_endpoint(lambda: DatagramProto(create_future=True, loop=loop), sock=sock)
+    transport, protocol = loop.run_until_complete(fut)
+    transport.close()
+    loop.run_until_complete(protocol.done)
+    assert protocol.state == 'CLOSED'
 
 
-# @pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'), reason='no UDS')
-# def test_create_datagram_endpoint_sock_unix(loop):
-#     fut = loop.create_datagram_endpoint(
-#         lambda: DatagramProto(create_future=True, loop=loop),
-#         family=socket.AF_UNIX)
-#     transport, protocol = loop.run_until_complete(fut)
-#     assert transport._sock.family == socket.AF_UNIX
-#     transport.close()
-#     loop.run_until_complete(protocol.done)
-#     assert protocol.state == 'CLOSED'
+@pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'), reason='no UDS')
+def test_create_datagram_endpoint_sock_unix(loop):
+    fut = loop.create_datagram_endpoint(lambda: DatagramProto(create_future=True, loop=loop), family=socket.AF_UNIX)
+    transport, protocol = loop.run_until_complete(fut)
+    # Check that the socket family is AF_UNIX using get_extra_info
+    sock_info = transport.get_extra_info('socket')
+    assert sock_info.family == socket.AF_UNIX
+    transport.close()
+    loop.run_until_complete(protocol.done)
+    assert protocol.state == 'CLOSED'
 
 
-# def test_create_datagram_endpoint_existing_sock_unix(loop):
-#     with _unix_socket_path() as path:
-#         sock = socket.socket(socket.AF_UNIX, type=socket.SOCK_DGRAM)
-#         sock.bind(path)
-#         sock.close()
+def test_create_datagram_endpoint_local_addr(loop):
+    fut = loop.create_datagram_endpoint(
+        lambda: DatagramProto(create_future=True, loop=loop), local_addr=('127.0.0.1', 0)
+    )
+    transport, protocol = loop.run_until_complete(fut)
+    transport.close()
+    loop.run_until_complete(protocol.done)
+    assert protocol.state == 'CLOSED'
 
-#         coro = loop.create_datagram_endpoint(
-#             lambda: DatagramProto(create_future=True, loop=loop),
-#             path, family=socket.AF_UNIX)
-#         transport, protocol = loop.run_until_complete(coro)
-#         transport.close()
-#         loop.run_until_complete(protocol.done)
+
+def test_create_datagram_endpoint_remote_addr(loop):
+    fut = loop.create_datagram_endpoint(
+        lambda: DatagramProto(create_future=True, loop=loop), remote_addr=('127.0.0.1', 12345)
+    )
+    transport, protocol = loop.run_until_complete(fut)
+    transport.close()
+    loop.run_until_complete(protocol.done)
+    assert protocol.state == 'CLOSED'

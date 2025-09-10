@@ -8,15 +8,19 @@ use std::os::windows::io::RawSocket;
 use mio::{Interest, Registry, Token, event::Source as MioSource, net::TcpListener};
 
 pub(crate) enum Source {
-    TCPListener(TcpListener),
-    #[cfg(unix)]
-    TCPStream(RawFd),
-    #[cfg(windows)]
-    TCPStream(RawSocket),
     #[cfg(unix)]
     FD(RawFd),
     #[cfg(windows)]
     FD(RawSocket),
+    TCPListener(TcpListener),
+    // #[cfg(unix)]
+    // TCPStream(RawFd),
+    // #[cfg(windows)]
+    // TCPStream(RawSocket),
+    // #[cfg(unix)]
+    // UDPSocket(RawFd),
+    // #[cfg(windows)]
+    // UDPSocket(RawSocket),
 }
 
 #[cfg(windows)]
@@ -43,36 +47,33 @@ impl MioSource for Source {
     #[inline]
     fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         match self {
-            Self::TCPListener(inner) => inner.register(registry, token, interests),
-            Self::TCPStream(inner) => SourceFd(inner).register(registry, token, interests),
             #[cfg(unix)]
             Self::FD(inner) => SourceFd(inner).register(registry, token, interests),
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
+            Self::TCPListener(inner) => inner.register(registry, token, interests),
         }
     }
 
     #[inline]
     fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> std::io::Result<()> {
         match self {
-            Self::TCPListener(inner) => inner.reregister(registry, token, interests),
-            Self::TCPStream(inner) => SourceFd(inner).reregister(registry, token, interests),
             #[cfg(unix)]
             Self::FD(inner) => SourceFd(inner).reregister(registry, token, interests),
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
+            Self::TCPListener(inner) => inner.reregister(registry, token, interests),
         }
     }
 
     #[inline]
     fn deregister(&mut self, registry: &Registry) -> std::io::Result<()> {
         match self {
-            Self::TCPListener(inner) => inner.deregister(registry),
-            Self::TCPStream(inner) => SourceFd(inner).deregister(registry),
             #[cfg(unix)]
             Self::FD(inner) => SourceFd(inner).deregister(registry),
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
+            Self::TCPListener(inner) => inner.deregister(registry),
         }
     }
 }

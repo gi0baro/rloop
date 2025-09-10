@@ -19,6 +19,7 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
+    udp::{UDPReadHandle, UDPTransport, UDPWriteHandle},
 };
 
 enum IOHandle {
@@ -26,6 +27,7 @@ enum IOHandle {
     Signals,
     TCPListener(TCPListenerHandleData),
     TCPStream(Interest),
+    UDPSocket(Interest),
 }
 
 struct PyHandleData {
@@ -73,6 +75,7 @@ pub struct EventLoop {
     task_factory: RwLock<PyObject>,
     tcp_lstreams: papaya::HashMap<usize, papaya::HashSet<usize>>,
     tcp_transports: papaya::HashMap<usize, Py<TCPTransport>>,
+    udp_transports: papaya::HashMap<usize, Py<UDPTransport>>,
     thread_id: atomic::AtomicI64,
     watcher_child: RwLock<PyObject>,
     #[pyo3(get)]
@@ -149,6 +152,7 @@ impl EventLoop {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
+                        IOHandle::UDPSocket(_) => self.handle_io_udp(event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
                 }
@@ -231,7 +235,7 @@ impl EventLoop {
                 let fd = stream.as_raw_fd() as usize;
                 let token = Token(fd);
                 #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::TCPStream(fd as i32);
+                let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
                 transports.insert(fd, pytransport);
                 lstreams.insert(fd);
@@ -251,6 +255,16 @@ impl EventLoop {
             handles_ready.push_back(Box::new(TCPReadHandle { fd }));
         } else if event.is_writable() {
             handles_ready.push_back(Box::new(TCPWriteHandle { fd }));
+        }
+    }
+
+    #[inline]
+    fn handle_io_udp(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
+        let fd = event.token().0;
+        if event.is_readable() {
+            handles_ready.push_back(Box::new(UDPReadHandle { fd }));
+        } else if event.is_writable() {
+            handles_ready.push_back(Box::new(UDPWriteHandle { fd }));
         }
     }
 
@@ -338,7 +352,7 @@ impl EventLoop {
             },
             || {
                 #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::TCPStream(fd as i32);
+                let mut source = Source::FD(fd as i32);
                 {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
@@ -401,6 +415,83 @@ impl EventLoop {
         if let Some(streams_ref) = self.tcp_lstreams.pin().get(&fd) {
             func(streams_ref);
         }
+    }
+
+    #[inline]
+    pub(crate) fn udp_socket_add(&self, fd: usize, interest: Interest) {
+        let token = Token(fd);
+        self.handles_io.pin().update_or_insert_with(
+            token,
+            |io_handle| {
+                if let IOHandle::UDPSocket(interest_prev) = io_handle {
+                    if *interest_prev == interest {
+                        return IOHandle::UDPSocket(interest);
+                    }
+
+                    let interests = *interest_prev | interest;
+                    {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut source = Source::FD(fd as i32);
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut source, token, interests);
+                    }
+                    return IOHandle::UDPSocket(interests);
+                }
+                unreachable!()
+            },
+            || {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().register(&mut source, token, interest);
+                }
+                IOHandle::UDPSocket(interest)
+            },
+        );
+    }
+
+    #[inline]
+    pub(crate) fn udp_socket_rem(&self, fd: usize, interest: Interest) {
+        let token = Token(fd);
+
+        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
+            if let IOHandle::UDPSocket(interest_ex) = io_handle {
+                return *interest_ex == interest;
+            }
+            false
+        }) {
+            Ok(None) => {}
+            Ok(_) => {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                let guard_poll = self.io.lock().unwrap();
+                _ = guard_poll.registry().deregister(&mut source);
+            }
+            _ => {
+                self.handles_io.pin().update(token, |io_handle| {
+                    if let IOHandle::UDPSocket(interest_ex) = io_handle {
+                        let interest_new = interest_ex.remove(interest).unwrap();
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut source = Source::FD(fd as i32);
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut source, token, interest_new);
+                        return IOHandle::UDPSocket(interest_new);
+                    }
+                    unreachable!()
+                });
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn udp_socket_close(&self, fd: usize) {
+        self.udp_transports.pin().remove(&fd);
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_udp_transport(&self, fd: usize, py: Python) -> Py<UDPTransport> {
+        self.udp_transports.pin().get(&fd).unwrap().clone_ref(py)
     }
 
     pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {
@@ -631,6 +722,7 @@ impl EventLoop {
             task_factory: RwLock::new(py.None()),
             tcp_lstreams: papaya::HashMap::with_capacity(32),
             tcp_transports: papaya::HashMap::with_capacity(1024),
+            udp_transports: papaya::HashMap::with_capacity(1024),
             thread_id: atomic::AtomicI64::new(0),
             watcher_child: RwLock::new(py.None()),
             _asyncgens: weakset(py)?.unbind(),
@@ -1108,6 +1200,23 @@ impl EventLoop {
 
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         self.tcp_transports.pin().contains_key(&fd)
+    }
+
+    fn _udp_conn(
+        pyself: Py<Self>,
+        py: Python,
+        sock: (i32, i32),
+        protocol_factory: PyObject,
+        remote_addr: Option<(String, u16)>,
+    ) -> PyResult<(Py<UDPTransport>, PyObject)> {
+        let rself = pyself.get();
+        let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, remote_addr);
+        let fd = transport.fd;
+        let pytransport = Py::new(py, transport)?;
+        let proto = UDPTransport::attach(&pytransport, py)?;
+        rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
+        rself.udp_socket_add(fd, Interest::READABLE);
+        Ok((pytransport, proto))
     }
 
     fn _sig_add(&self, py: Python, sig: u8, callback: PyObject, args: PyObject, context: PyObject) {
