@@ -8,8 +8,6 @@ use std::{
 };
 
 use anyhow::Result;
-#[cfg(unix)]
-use mio::unix::SourceFd;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
@@ -21,7 +19,7 @@ use crate::{
     server::Server,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
-    udp::{UDPReadHandle, UDPTransport},
+    udp::{UDPReadHandle, UDPTransport, UDPWriteHandle},
 };
 
 enum IOHandle {
@@ -29,7 +27,7 @@ enum IOHandle {
     Signals,
     TCPListener(TCPListenerHandleData),
     TCPStream(Interest),
-    UDPSocket,
+    UDPSocket(Interest),
 }
 
 struct PyHandleData {
@@ -154,7 +152,7 @@ impl EventLoop {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
-                        IOHandle::UDPSocket => self.handle_io_udp(event, &mut cb_handles),
+                        IOHandle::UDPSocket(_) => self.handle_io_udp(event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
                 }
@@ -237,7 +235,7 @@ impl EventLoop {
                 let fd = stream.as_raw_fd() as usize;
                 let token = Token(fd);
                 #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::TCPStream(fd as i32);
+                let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
                 transports.insert(fd, pytransport);
                 lstreams.insert(fd);
@@ -264,7 +262,9 @@ impl EventLoop {
     fn handle_io_udp(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
         let fd = event.token().0;
         if event.is_readable() {
-            handles_ready.push_back(Box::new(UDPReadHandle::new(fd)));
+            handles_ready.push_back(Box::new(UDPReadHandle { fd }));
+        } else if event.is_writable() {
+            handles_ready.push_back(Box::new(UDPWriteHandle { fd }));
         }
     }
 
@@ -352,7 +352,7 @@ impl EventLoop {
             },
             || {
                 #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::TCPStream(fd as i32);
+                let mut source = Source::FD(fd as i32);
                 {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
@@ -418,28 +418,74 @@ impl EventLoop {
     }
 
     #[inline]
-    pub(crate) fn udp_socket_add(&self, fd: usize) {
+    pub(crate) fn udp_socket_add(&self, fd: usize, interest: Interest) {
         let token = Token(fd);
-        #[allow(clippy::cast_possible_wrap)]
-        let mut source = Source::UDPSocket(fd as i32);
-        let guard_poll = self.io.lock().unwrap();
-        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
-        self.handles_io.pin().insert(token, IOHandle::UDPSocket);
+        self.handles_io.pin().update_or_insert_with(
+            token,
+            |io_handle| {
+                if let IOHandle::UDPSocket(interest_prev) = io_handle {
+                    if *interest_prev == interest {
+                        return IOHandle::UDPSocket(interest);
+                    }
+
+                    let interests = *interest_prev | interest;
+                    {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut source = Source::FD(fd as i32);
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut source, token, interests);
+                    }
+                    return IOHandle::UDPSocket(interests);
+                }
+                unreachable!()
+            },
+            || {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                {
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().register(&mut source, token, interest);
+                }
+                IOHandle::UDPSocket(interest)
+            },
+        );
     }
 
     #[inline]
-    pub(crate) fn udp_socket_rem(&self, fd: usize) {
+    pub(crate) fn udp_socket_rem(&self, fd: usize, interest: Interest) {
         let token = Token(fd);
-        if self.handles_io.pin().remove(&token).is_some() {
-            let io = self.io.lock().unwrap();
-            #[allow(clippy::cast_possible_wrap)]
-            let _ = io.registry().deregister(&mut SourceFd(&(fd as i32)));
+
+        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
+            if let IOHandle::UDPSocket(interest_ex) = io_handle {
+                return *interest_ex == interest;
+            }
+            false
+        }) {
+            Ok(None) => {}
+            Ok(_) => {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                let guard_poll = self.io.lock().unwrap();
+                _ = guard_poll.registry().deregister(&mut source);
+            }
+            _ => {
+                self.handles_io.pin().update(token, |io_handle| {
+                    if let IOHandle::UDPSocket(interest_ex) = io_handle {
+                        let interest_new = interest_ex.remove(interest).unwrap();
+                        #[allow(clippy::cast_possible_wrap)]
+                        let mut source = Source::FD(fd as i32);
+                        let guard_poll = self.io.lock().unwrap();
+                        _ = guard_poll.registry().reregister(&mut source, token, interest_new);
+                        return IOHandle::UDPSocket(interest_new);
+                    }
+                    unreachable!()
+                });
+            }
         }
     }
 
     #[inline]
-    pub(crate) fn udp_socket_close(&self, _py: Python, fd: usize) {
-        self.udp_socket_rem(fd);
+    pub(crate) fn udp_socket_close(&self, fd: usize) {
         self.udp_transports.pin().remove(&fd);
     }
 
@@ -1169,7 +1215,7 @@ impl EventLoop {
         let pytransport = Py::new(py, transport)?;
         let proto = UDPTransport::attach(&pytransport, py)?;
         rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.udp_socket_add(fd);
+        rself.udp_socket_add(fd, Interest::READABLE);
         Ok((pytransport, proto))
     }
 

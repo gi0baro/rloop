@@ -13,14 +13,14 @@ pub(crate) enum Source {
     #[cfg(windows)]
     FD(RawSocket),
     TCPListener(TcpListener),
-    #[cfg(unix)]
-    TCPStream(RawFd),
-    #[cfg(windows)]
-    TCPStream(RawSocket),
-    #[cfg(unix)]
-    UDPSocket(RawFd),
-    #[cfg(windows)]
-    UDPSocket(RawSocket),
+    // #[cfg(unix)]
+    // TCPStream(RawFd),
+    // #[cfg(windows)]
+    // TCPStream(RawSocket),
+    // #[cfg(unix)]
+    // UDPSocket(RawFd),
+    // #[cfg(windows)]
+    // UDPSocket(RawSocket),
 }
 
 #[cfg(windows)]
@@ -52,8 +52,6 @@ impl MioSource for Source {
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
             Self::TCPListener(inner) => inner.register(registry, token, interests),
-            Self::TCPStream(inner) => SourceFd(inner).register(registry, token, interests),
-            Self::UDPSocket(inner) => SourceFd(inner).register(registry, token, interests),
         }
     }
 
@@ -65,8 +63,6 @@ impl MioSource for Source {
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
             Self::TCPListener(inner) => inner.reregister(registry, token, interests),
-            Self::TCPStream(inner) => SourceFd(inner).reregister(registry, token, interests),
-            Self::UDPSocket(inner) => SourceFd(inner).reregister(registry, token, interests),
         }
     }
 
@@ -78,8 +74,6 @@ impl MioSource for Source {
             #[cfg(windows)]
             Self::FD(inner) => SourceRawSocket(inner).register(registry, token, interests),
             Self::TCPListener(inner) => inner.deregister(registry),
-            Self::TCPStream(inner) => SourceFd(inner).deregister(registry),
-            Self::UDPSocket(inner) => SourceFd(inner).deregister(registry),
         }
     }
 }
