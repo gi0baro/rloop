@@ -28,11 +28,11 @@ pub(crate) struct TCPServer {
     pub fd: i32,
     sfamily: i32,
     backlog: i32,
-    protocol_factory: PyObject,
+    protocol_factory: Py<PyAny>,
 }
 
 impl TCPServer {
-    pub(crate) fn from_fd(fd: i32, sfamily: i32, backlog: i32, protocol_factory: PyObject) -> Self {
+    pub(crate) fn from_fd(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>) -> Self {
         Self {
             fd,
             sfamily,
@@ -94,7 +94,7 @@ pub(crate) struct TCPServerRef {
     pub fd: usize,
     pyloop: Py<EventLoop>,
     sfamily: i32,
-    proto_factory: PyObject,
+    proto_factory: Py<PyAny>,
 }
 
 impl TCPServerRef {
@@ -143,14 +143,14 @@ pub(crate) struct TCPTransport {
     water_lo: atomic::AtomicUsize,
     weof: atomic::AtomicBool,
     // py protocol fields
-    proto: PyObject,
+    proto: Py<PyAny>,
     proto_buffered: bool,
     proto_paused: atomic::AtomicBool,
-    protom_buf_get: PyObject,
-    protom_conn_lost: PyObject,
-    protom_recv_data: PyObject,
+    protom_buf_get: Py<PyAny>,
+    protom_conn_lost: Py<PyAny>,
+    protom_recv_data: Py<PyAny>,
     // py extras
-    extra: HashMap<String, PyObject>,
+    extra: HashMap<String, Py<PyAny>>,
     sock: Py<SocketWrapper>,
 }
 
@@ -174,8 +174,8 @@ impl TCPTransport {
         let wl = wh / 4;
 
         let mut proto_buffered = false;
-        let protom_buf_get: PyObject;
-        let protom_recv_data: PyObject;
+        let protom_buf_get: Py<PyAny>;
+        let protom_recv_data: Py<PyAny>;
         if pyproto.is_instance(asyncio_proto_buf(py).unwrap()).unwrap() {
             proto_buffered = true;
             protom_buf_get = pyproto.getattr(pyo3::intern!(py, "get_buffer")).unwrap().unbind();
@@ -208,7 +208,7 @@ impl TCPTransport {
         }
     }
 
-    pub(crate) fn from_py(py: Python, pyloop: &Py<EventLoop>, pysock: (i32, i32), proto_factory: PyObject) -> Self {
+    pub(crate) fn from_py(py: Python, pyloop: &Py<EventLoop>, pysock: (i32, i32), proto_factory: Py<PyAny>) -> Self {
         let sock = unsafe { socket2::Socket::from_raw_fd(pysock.0) };
         _ = sock.set_nonblocking(true);
         let stdl: std::net::TcpStream = sock.into();
@@ -219,7 +219,7 @@ impl TCPTransport {
         Self::new(py, pyloop.clone_ref(py), stream, proto, pysock.1, None)
     }
 
-    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<PyObject> {
+    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
         rself
             .proto
@@ -380,7 +380,7 @@ impl TCPTransport {
 #[pymethods]
 impl TCPTransport {
     #[pyo3(signature = (name, default = None))]
-    fn get_extra_info(&self, py: Python, name: &str, default: Option<PyObject>) -> Option<PyObject> {
+    fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
         match name {
             "socket" => Some(self.sock.clone_ref(py).into_any()),
             "sockname" => self.sock.call_method0(py, pyo3::intern!(py, "getsockname")).ok(),
@@ -411,13 +411,13 @@ impl TCPTransport {
         }
     }
 
-    fn set_protocol(&self, _protocol: PyObject) -> PyResult<()> {
+    fn set_protocol(&self, _protocol: Py<PyAny>) -> PyResult<()> {
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "TCPTransport protocol cannot be changed",
         ))
     }
 
-    fn get_protocol(&self, py: Python) -> PyObject {
+    fn get_protocol(&self, py: Python) -> Py<PyAny> {
         self.proto.clone_ref(py)
     }
 
@@ -554,7 +554,7 @@ pub(crate) struct TCPReadHandle {
 
 impl TCPReadHandle {
     #[inline]
-    fn recv_direct(&self, py: Python, transport: &TCPTransport, buf: &mut [u8]) -> (Option<PyObject>, bool) {
+    fn recv_direct(&self, py: Python, transport: &TCPTransport, buf: &mut [u8]) -> (Option<Py<PyAny>>, bool) {
         let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, buf);
         if read > 0 {
             let rbuf = &buf[..read];
@@ -565,7 +565,7 @@ impl TCPReadHandle {
     }
 
     #[inline]
-    fn recv_buffered(&self, py: Python, transport: &TCPTransport) -> (Option<PyObject>, bool) {
+    fn recv_buffered(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool) {
         // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
         //       which is smth we can't really use to read from `TcpStream`.
         //       So even if this sucks, we copy data back and forth, at least until

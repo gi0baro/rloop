@@ -37,13 +37,13 @@ pub(crate) struct UDPTransport {
     water_hi: atomic::AtomicUsize,
     water_lo: atomic::AtomicUsize,
     // py protocol fields
-    proto: PyObject,
+    proto: Py<PyAny>,
     proto_paused: atomic::AtomicBool,
-    protom_conn_lost: PyObject,
-    protom_datagram_received: PyObject,
-    protom_error_received: PyObject,
+    protom_conn_lost: Py<PyAny>,
+    protom_datagram_received: Py<PyAny>,
+    protom_error_received: Py<PyAny>,
     // py extras
-    extra: HashMap<String, PyObject>,
+    extra: HashMap<String, Py<PyAny>>,
     sock: Py<SocketWrapper>,
 }
 
@@ -96,7 +96,7 @@ impl UDPTransport {
         py: Python,
         pyloop: &Py<EventLoop>,
         pysock: (i32, i32),
-        proto_factory: PyObject,
+        proto_factory: Py<PyAny>,
         remote_addr_tup: Option<(String, u16)>,
     ) -> Self {
         let sock = unsafe { socket2::Socket::from_raw_fd(pysock.0) };
@@ -110,7 +110,7 @@ impl UDPTransport {
         Self::new(py, pyloop.clone_ref(py), socket, proto, pysock.1, remote_addr)
     }
 
-    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<PyObject> {
+    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
         rself
             .proto
@@ -255,7 +255,7 @@ impl UDPTransport {
 #[pymethods]
 impl UDPTransport {
     #[pyo3(signature = (name, default = None))]
-    fn get_extra_info(&self, py: Python, name: &str, default: Option<PyObject>) -> Option<PyObject> {
+    fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
         match name {
             "socket" => Some(self.sock.clone_ref(py).into_any()),
             "sockname" => self.sock.call_method0(py, pyo3::intern!(py, "getsockname")).ok(),
@@ -305,13 +305,13 @@ impl UDPTransport {
         self.call_conn_lost(py, None);
     }
 
-    fn set_protocol(&self, _protocol: PyObject) -> PyResult<()> {
+    fn set_protocol(&self, _protocol: Py<PyAny>) -> PyResult<()> {
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "UDPTransport protocol cannot be changed",
         ))
     }
 
-    fn get_protocol(&self, py: Python) -> PyObject {
+    fn get_protocol(&self, py: Python) -> Py<PyAny> {
         self.proto.clone_ref(py)
     }
 

@@ -6,14 +6,14 @@ pub(crate) enum LogExc {
 }
 
 impl LogExc {
-    pub(crate) fn cb_handle(exc: PyErr, msg: String, handle: PyObject) -> Self {
+    pub(crate) fn cb_handle(exc: PyErr, msg: String, handle: Py<PyAny>) -> Self {
         Self::CBHandle(LogExcCBHandleData {
             base: LogExcBaseData { exc, msg },
             handle,
         })
     }
 
-    pub(crate) fn transport(exc: PyErr, msg: String, protocol: PyObject, transport: PyObject) -> Self {
+    pub(crate) fn transport(exc: PyErr, msg: String, protocol: Py<PyAny>, transport: Py<PyAny>) -> Self {
         Self::Transport(LogExcTransportData {
             base: LogExcBaseData { exc, msg },
             protocol,
@@ -29,13 +29,13 @@ struct LogExcBaseData {
 
 pub(crate) struct LogExcCBHandleData {
     base: LogExcBaseData,
-    handle: PyObject,
+    handle: Py<PyAny>,
 }
 
 pub(crate) struct LogExcTransportData {
     base: LogExcBaseData,
-    protocol: PyObject,
-    transport: PyObject,
+    protocol: Py<PyAny>,
+    transport: Py<PyAny>,
 }
 
 macro_rules! log_exc_base_data_to_dict {

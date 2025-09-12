@@ -1,39 +1,39 @@
-use pyo3::{prelude::*, sync::GILOnceCell};
+use pyo3::{prelude::*, sync::PyOnceLock};
 use std::convert::Into;
 
-static ASYNCIO: GILOnceCell<PyObject> = GILOnceCell::new();
-static ASYNCIO_PROTO_BUF: GILOnceCell<PyObject> = GILOnceCell::new();
-static SOCKET: GILOnceCell<PyObject> = GILOnceCell::new();
-static WEAKREF: GILOnceCell<PyObject> = GILOnceCell::new();
+static ASYNCIO: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static ASYNCIO_PROTO_BUF: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SOCKET: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static WEAKREF: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
-fn asyncio(py: Python) -> PyResult<&Bound<PyAny>> {
+fn asyncio(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(ASYNCIO
         .get_or_try_init(py, || py.import("asyncio").map(Into::into))?
         .bind(py))
 }
 
-fn socket(py: Python) -> PyResult<&Bound<PyAny>> {
+fn socket(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(SOCKET
         .get_or_try_init(py, || py.import("socket").map(Into::into))?
         .bind(py))
 }
 
-pub(crate) fn asyncio_proto_buf(py: Python) -> PyResult<&Bound<PyAny>> {
+pub(crate) fn asyncio_proto_buf(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(ASYNCIO_PROTO_BUF
         .get_or_try_init(py, || {
             let ret = asyncio(py)?.getattr("protocols")?.getattr("BufferedProtocol")?;
-            Ok::<PyObject, PyErr>(ret.unbind())
+            Ok::<Py<PyAny>, PyErr>(ret.unbind())
         })?
         .bind(py))
 }
 
-fn weakref(py: Python) -> PyResult<&Bound<PyAny>> {
+fn weakref(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(WEAKREF
         .get_or_try_init(py, || py.import("weakref").map(Into::into))?
         .bind(py))
 }
 
-pub(crate) fn copy_context(py: Python) -> PyObject {
+pub(crate) fn copy_context(py: Python) -> Py<PyAny> {
     let ctx = unsafe {
         let ptr = pyo3::ffi::PyContext_CopyCurrent();
         Bound::from_owned_ptr(py, ptr)

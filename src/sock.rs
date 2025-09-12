@@ -5,7 +5,7 @@ use crate::py::sock;
 
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct SocketWrapper {
-    sock: PyObject,
+    sock: Py<PyAny>,
 }
 
 impl SocketWrapper {
@@ -26,7 +26,7 @@ impl SocketWrapper {
 
 #[pymethods]
 impl SocketWrapper {
-    fn __getattr__(&self, py: Python, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(&self, py: Python, name: &str) -> PyResult<Py<PyAny>> {
         self.sock.getattr(py, name)
     }
 }

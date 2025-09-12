@@ -21,29 +21,29 @@ pub(crate) type BoxedHandle = Box<dyn Handle + Send>;
 
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct CBHandle {
-    callback: PyObject,
-    args: PyObject,
-    context: PyObject,
+    callback: Py<PyAny>,
+    args: Py<PyAny>,
+    context: Py<PyAny>,
     cancelled: atomic::AtomicBool,
 }
 
 #[pyclass(frozen, module = "rloop._rloop", name = "CBHandle0")]
 pub(crate) struct CBHandleNoArgs {
-    callback: PyObject,
-    context: PyObject,
+    callback: Py<PyAny>,
+    context: Py<PyAny>,
     cancelled: atomic::AtomicBool,
 }
 
 #[pyclass(frozen, module = "rloop._rloop", name = "CBHandle1")]
 pub(crate) struct CBHandleOneArg {
-    callback: PyObject,
-    arg: PyObject,
-    context: PyObject,
+    callback: Py<PyAny>,
+    arg: Py<PyAny>,
+    context: Py<PyAny>,
     cancelled: atomic::AtomicBool,
 }
 
 impl CBHandle {
-    pub(crate) fn new(callback: PyObject, args: PyObject, context: PyObject) -> Self {
+    pub(crate) fn new(callback: Py<PyAny>, args: Py<PyAny>, context: Py<PyAny>) -> Self {
         Self {
             callback,
             args,
@@ -53,7 +53,7 @@ impl CBHandle {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn new0(callback: PyObject, context: PyObject) -> CBHandleNoArgs {
+    pub(crate) fn new0(callback: Py<PyAny>, context: Py<PyAny>) -> CBHandleNoArgs {
         CBHandleNoArgs {
             callback,
             context,
@@ -61,7 +61,7 @@ impl CBHandle {
         }
     }
 
-    pub(crate) fn new1(callback: PyObject, arg: PyObject, context: PyObject) -> CBHandleOneArg {
+    pub(crate) fn new1(callback: Py<PyAny>, arg: Py<PyAny>, context: Py<PyAny>) -> CBHandleOneArg {
         CBHandleOneArg {
             callback,
             arg,

@@ -15,15 +15,15 @@ pub(crate) struct Server {
     #[pyo3(get)]
     _loop: Py<EventLoop>,
     #[pyo3(get)]
-    _sockets: PyObject,
+    _sockets: Py<PyAny>,
     closed: atomic::AtomicBool,
     serving: atomic::AtomicBool,
     servers: Vec<ServerType>,
-    // serve_forever_fut: RwLock<Option<PyObject>>,
+    // serve_forever_fut: RwLock<Option<Py<PyAny>>>,
 }
 
 impl Server {
-    pub(crate) fn tcp(event_loop: Py<EventLoop>, sockets: PyObject, servers: Vec<TCPServer>) -> Self {
+    pub(crate) fn tcp(event_loop: Py<EventLoop>, sockets: Py<PyAny>, servers: Vec<TCPServer>) -> Self {
         let srv: Vec<ServerType> = servers.into_iter().map(ServerType::TCP).collect();
 
         Self {
@@ -41,19 +41,19 @@ impl Server {
 #[pymethods]
 impl Server {
     // needed?
-    // fn _add_waiter(&self, waiter: PyObject) {
+    // fn _add_waiter(&self, waiter: Py<PyAny>) {
     //     let mut guard = self.waiters.write().unwrap();
     //     guard.push(waiter);
     // }
 
     // #[getter(_sff)]
-    // fn _get_sff(&self, py: Python) -> Option<PyObject> {
+    // fn _get_sff(&self, py: Python) -> Option<Py<PyAny>> {
     //     let guard = self.serve_forever_fut.read().unwrap();
     //     guard.as_ref().map(|v| v.clone_ref(py))
     // }
 
     // #[setter(_sff)]
-    // fn _set_sff(&self, val: PyObject) {
+    // fn _set_sff(&self, val: Py<PyAny>) {
     //     let mut guard = self.serve_forever_fut.write().unwrap();
     //     *guard = Some(val);
     // }

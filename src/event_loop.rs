@@ -60,28 +60,28 @@ pub struct EventLoop {
     counter_ready: atomic::AtomicUsize,
     ssock: RwLock<Option<(socket2::Socket, socket2::Socket)>>,
     closed: atomic::AtomicBool,
-    exc_handler: RwLock<PyObject>,
-    exception_handler: RwLock<PyObject>,
-    executor: RwLock<PyObject>,
+    exc_handler: RwLock<Py<PyAny>>,
+    exception_handler: RwLock<Py<PyAny>>,
+    executor: RwLock<Py<PyAny>>,
     sig_handlers: papaya::HashMap<u8, Py<CBHandle>>,
     sig_listening: atomic::AtomicBool,
     sig_loop_handled: atomic::AtomicBool,
-    sig_wfd: RwLock<PyObject>,
+    sig_wfd: RwLock<Py<PyAny>>,
     stopping: atomic::AtomicBool,
     shutdown_called_asyncgens: atomic::AtomicBool,
     shutdown_called_executor: atomic::AtomicBool,
-    ssock_r: RwLock<PyObject>,
-    ssock_w: RwLock<PyObject>,
-    task_factory: RwLock<PyObject>,
+    ssock_r: RwLock<Py<PyAny>>,
+    ssock_w: RwLock<Py<PyAny>>,
+    task_factory: RwLock<Py<PyAny>>,
     tcp_lstreams: papaya::HashMap<usize, papaya::HashSet<usize>>,
     tcp_transports: papaya::HashMap<usize, Py<TCPTransport>>,
     udp_transports: papaya::HashMap<usize, Py<UDPTransport>>,
     thread_id: atomic::AtomicI64,
-    watcher_child: RwLock<PyObject>,
+    watcher_child: RwLock<Py<PyAny>>,
     #[pyo3(get)]
-    _asyncgens: PyObject,
+    _asyncgens: Py<PyAny>,
     #[pyo3(get)]
-    _base_ctx: PyObject,
+    _base_ctx: Py<PyAny>,
 }
 
 impl EventLoop {
@@ -118,7 +118,7 @@ impl EventLoop {
             if idle_swap {
                 self.idle.store(true, atomic::Ordering::Release);
             }
-            let res = py.allow_threads(|| {
+            let res = py.detach(|| {
                 let mut io = self.io.lock().unwrap();
                 let res = io.poll(&mut state.events, sched_time.map(Duration::from_micros));
                 if idle_swap {
@@ -494,7 +494,7 @@ impl EventLoop {
         self.udp_transports.pin().get(&fd).unwrap().clone_ref(py)
     }
 
-    pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<PyObject> {
+    pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<Py<PyAny>> {
         let handler = self.exc_handler.read().unwrap();
         handler.call1(
             py,
@@ -506,8 +506,8 @@ impl EventLoop {
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn schedule0(&self, callback: PyObject, context: Option<PyObject>) -> Result<()> {
-        let handle = Python::with_gil(|py| {
+    pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new0(callback, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -527,8 +527,8 @@ impl EventLoop {
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn schedule1(&self, callback: PyObject, arg: PyObject, context: Option<PyObject>) -> Result<()> {
-        let handle = Python::with_gil(|py| {
+    pub fn schedule1(&self, callback: Py<PyAny>, arg: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new1(callback, arg, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -548,8 +548,8 @@ impl EventLoop {
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn schedule(&self, callback: PyObject, args: PyObject, context: Option<PyObject>) -> Result<()> {
-        let handle = Python::with_gil(|py| {
+    pub fn schedule(&self, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new1(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -569,9 +569,9 @@ impl EventLoop {
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn schedule_later0(&self, delay: Duration, callback: PyObject, context: Option<PyObject>) -> Result<()> {
+    pub fn schedule_later0(&self, delay: Duration, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
-        let handle = Python::with_gil(|py| {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new0(callback, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -597,12 +597,12 @@ impl EventLoop {
     pub fn schedule_later1(
         &self,
         delay: Duration,
-        callback: PyObject,
-        arg: PyObject,
-        context: Option<PyObject>,
+        callback: Py<PyAny>,
+        arg: Py<PyAny>,
+        context: Option<Py<PyAny>>,
     ) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
-        let handle = Python::with_gil(|py| {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new1(callback, arg, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -628,12 +628,12 @@ impl EventLoop {
     pub fn schedule_later(
         &self,
         delay: Duration,
-        callback: PyObject,
-        args: PyObject,
-        context: Option<PyObject>,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
     ) -> Result<()> {
         let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
-        let handle = Python::with_gil(|py| {
+        let handle = Python::attach(|py| {
             Py::new(
                 py,
                 CBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
@@ -776,34 +776,34 @@ impl EventLoop {
     }
 
     #[getter(_default_executor)]
-    fn _get_default_executor(&self, py: Python) -> PyObject {
+    fn _get_default_executor(&self, py: Python) -> Py<PyAny> {
         self.executor.read().unwrap().clone_ref(py)
     }
 
     #[setter(_default_executor)]
-    fn _set_default_executor(&self, val: PyObject) {
+    fn _set_default_executor(&self, val: Py<PyAny>) {
         let mut guard = self.executor.write().unwrap();
         *guard = val;
     }
 
     #[getter(_exc_handler)]
-    fn _get_exc_handler(&self, py: Python) -> PyObject {
+    fn _get_exc_handler(&self, py: Python) -> Py<PyAny> {
         self.exc_handler.read().unwrap().clone_ref(py)
     }
 
     #[setter(_exc_handler)]
-    fn _set_exc_handler(&self, val: PyObject) {
+    fn _set_exc_handler(&self, val: Py<PyAny>) {
         let mut guard = self.exc_handler.write().unwrap();
         *guard = val;
     }
 
     #[getter(_exception_handler)]
-    fn _get_exception_handler(&self, py: Python) -> PyObject {
+    fn _get_exception_handler(&self, py: Python) -> Py<PyAny> {
         self.exception_handler.read().unwrap().clone_ref(py)
     }
 
     #[setter(_exception_handler)]
-    fn _set_exception_handler(&self, val: PyObject) {
+    fn _set_exception_handler(&self, val: Py<PyAny>) {
         let mut guard = self.exception_handler.write().unwrap();
         *guard = val;
     }
@@ -829,56 +829,56 @@ impl EventLoop {
     }
 
     #[getter(_sig_wfd)]
-    fn _get_sig_wfd(&self, py: Python) -> PyObject {
+    fn _get_sig_wfd(&self, py: Python) -> Py<PyAny> {
         self.sig_wfd.read().unwrap().clone_ref(py)
     }
 
     #[setter(_sig_wfd)]
-    fn _set_sig_wfd(&self, val: PyObject) {
+    fn _set_sig_wfd(&self, val: Py<PyAny>) {
         let mut guard = self.sig_wfd.write().unwrap();
         *guard = val;
     }
 
     #[getter(_ssock_r)]
-    fn _get_ssock_r(&self, py: Python) -> PyObject {
+    fn _get_ssock_r(&self, py: Python) -> Py<PyAny> {
         self.ssock_r.read().unwrap().clone_ref(py)
     }
 
     #[setter(_ssock_r)]
-    fn _set_ssock_r(&self, val: PyObject) {
+    fn _set_ssock_r(&self, val: Py<PyAny>) {
         let mut guard = self.ssock_r.write().unwrap();
         *guard = val;
     }
 
     #[getter(_ssock_w)]
-    fn _get_ssock_w(&self, py: Python) -> PyObject {
+    fn _get_ssock_w(&self, py: Python) -> Py<PyAny> {
         self.ssock_w.read().unwrap().clone_ref(py)
     }
 
     #[setter(_ssock_w)]
-    fn _set_ssock_w(&self, val: PyObject) {
+    fn _set_ssock_w(&self, val: Py<PyAny>) {
         let mut guard = self.ssock_w.write().unwrap();
         *guard = val;
     }
 
     #[getter(_task_factory)]
-    fn _get_task_factory(&self, py: Python) -> PyObject {
+    fn _get_task_factory(&self, py: Python) -> Py<PyAny> {
         self.task_factory.read().unwrap().clone_ref(py)
     }
 
     #[setter(_task_factory)]
-    fn _set_task_factory(&self, factory: PyObject) {
+    fn _set_task_factory(&self, factory: Py<PyAny>) {
         let mut guard = self.task_factory.write().unwrap();
         *guard = factory;
     }
 
     #[getter(_watcher_child)]
-    fn _get_watcher_child(&self, py: Python) -> PyObject {
+    fn _get_watcher_child(&self, py: Python) -> Py<PyAny> {
         self.watcher_child.read().unwrap().clone_ref(py)
     }
 
     #[setter(_watcher_child)]
-    fn _set_watcher_child(&self, factory: PyObject) {
+    fn _set_watcher_child(&self, factory: Py<PyAny>) {
         let mut guard = self.watcher_child.write().unwrap();
         *guard = factory;
     }
@@ -923,7 +923,7 @@ impl EventLoop {
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(&self, py: Python, callback: PyObject, args: PyObject, context: Option<PyObject>) -> Py<CBHandle> {
+    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> Py<CBHandle> {
         let handle = Py::new(
             py,
             CBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py))),
@@ -943,9 +943,9 @@ impl EventLoop {
     fn call_soon_threadsafe(
         &self,
         py: Python,
-        callback: PyObject,
-        args: PyObject,
-        context: Option<PyObject>,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
     ) -> Py<CBHandle> {
         let handle = Py::new(
             py,
@@ -968,9 +968,9 @@ impl EventLoop {
         &self,
         py: Python,
         delay: u64,
-        callback: PyObject,
-        args: PyObject,
-        context: PyObject,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Py<PyAny>,
     ) -> TimerHandle {
         let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
         let handle = Py::new(py, CBHandle::new(callback, args, context)).unwrap();
@@ -991,9 +991,9 @@ impl EventLoop {
         &self,
         py: Python,
         fd: usize,
-        callback: PyObject,
-        args: PyObject,
-        context: Option<PyObject>,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
     ) -> Py<CBHandle> {
         let token = Token(fd);
         let handle = Py::new(
@@ -1081,9 +1081,9 @@ impl EventLoop {
         &self,
         py: Python,
         fd: usize,
-        callback: PyObject,
-        args: PyObject,
-        context: Option<PyObject>,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
     ) -> Py<CBHandle> {
         let token = Token(fd);
         let handle = Py::new(
@@ -1170,8 +1170,8 @@ impl EventLoop {
         pyself: Py<Self>,
         py: Python,
         sock: (i32, i32),
-        protocol_factory: PyObject,
-    ) -> PyResult<(Py<TCPTransport>, PyObject)> {
+        protocol_factory: Py<PyAny>,
+    ) -> PyResult<(Py<TCPTransport>, Py<PyAny>)> {
         let rself = pyself.get();
         let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
         let fd = transport.fd;
@@ -1185,9 +1185,9 @@ impl EventLoop {
     fn _tcp_server(
         pyself: Py<Self>,
         py: Python,
-        socks: PyObject,
+        socks: Py<PyAny>,
         rsocks: Vec<(i32, i32)>,
-        protocol_factory: PyObject,
+        protocol_factory: Py<PyAny>,
         backlog: i32,
     ) -> PyResult<Py<Server>> {
         let mut servers = Vec::new();
@@ -1206,9 +1206,9 @@ impl EventLoop {
         pyself: Py<Self>,
         py: Python,
         sock: (i32, i32),
-        protocol_factory: PyObject,
+        protocol_factory: Py<PyAny>,
         remote_addr: Option<(String, u16)>,
-    ) -> PyResult<(Py<UDPTransport>, PyObject)> {
+    ) -> PyResult<(Py<UDPTransport>, Py<PyAny>)> {
         let rself = pyself.get();
         let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, remote_addr);
         let fd = transport.fd;
@@ -1219,7 +1219,7 @@ impl EventLoop {
         Ok((pytransport, proto))
     }
 
-    fn _sig_add(&self, py: Python, sig: u8, callback: PyObject, args: PyObject, context: PyObject) {
+    fn _sig_add(&self, py: Python, sig: u8, callback: Py<PyAny>, args: Py<PyAny>, context: Py<PyAny>) {
         let handle = Py::new(py, CBHandle::new(callback, args, context)).unwrap();
         self.sig_handlers.pin().insert(sig, handle);
     }
