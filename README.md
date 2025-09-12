@@ -27,7 +27,6 @@ asyncio.set_event_loop(loop)
 
 At current time, when compared with the stdlib's event loop, RLoop doesn't support the following features:
 
-- UDP
 - Unix Domain Sockets
 - SSL
 - debugging
