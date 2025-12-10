@@ -215,8 +215,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     #     raise NotImplementedError
 
     def call_later(self, delay, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        if delay <= 0:
-            return self.call_soon(callback, *args, context=context or _copy_context())
         delay = round(delay * 1_000_000)
         return self._call_later(delay, callback, args, context or _copy_context())
 
