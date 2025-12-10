@@ -42,10 +42,17 @@ def test_call_later_negative(loop):
     def cb(arg):
         calls.append(arg)
 
-    loop.call_later(-1.0, cb, 1)
-    loop.call_later(-2.0, cb, 2)
-    run_loop(loop)
-    assert calls == [1, 2]
+    def stop():
+        loop.stop()
+
+    loop.call_later(-1.0, cb, -1)
+    loop.call_later(-2.0, cb, -2)
+    loop.call_later(0.5, cb, 5)
+    loop.call_later(0.3, cb, 3)
+    loop.call_later(0.7, stop)
+
+    loop.run_forever()
+    assert calls == [-2, -1, 3, 5]
 
 
 def test_call_at(loop):
