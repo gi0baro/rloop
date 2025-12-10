@@ -4,7 +4,7 @@ use crate::handles::BoxedHandle;
 
 pub(crate) struct Timer {
     pub handle: BoxedHandle,
-    pub when: u128,
+    pub when: i128,
 }
 
 impl PartialEq for Timer {

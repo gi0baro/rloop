@@ -102,10 +102,12 @@ impl EventLoop {
         } else {
             let guard_sched = self.handles_sched.lock().unwrap();
             if let Some(timer) = guard_sched.peek() {
-                let tick = Instant::now().duration_since(self.epoch).as_micros();
+                let tick = Instant::now().duration_since(self.epoch).as_micros() as i128;
                 if timer.when > tick {
                     let dt = (timer.when - tick) as u64;
                     sched_time = Some(dt);
+                } else if timer.when < 0 {
+                    sched_time = Some(0);
                 }
             }
         }
@@ -163,7 +165,7 @@ impl EventLoop {
         {
             let mut guard_sched = self.handles_sched.lock().unwrap();
             if let Some(timer) = guard_sched.peek() {
-                let tick = Instant::now().duration_since(self.epoch).as_micros();
+                let tick = Instant::now().duration_since(self.epoch).as_micros() as i128;
                 if timer.when <= tick {
                     while let Some(timer) = guard_sched.peek() {
                         if timer.when > tick {
@@ -570,7 +572,7 @@ impl EventLoop {
 
     #[allow(clippy::missing_errors_doc)]
     pub fn schedule_later0(&self, delay: Duration, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
-        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros() as i128;
         let handle = Python::attach(|py| {
             Py::new(
                 py,
@@ -601,7 +603,7 @@ impl EventLoop {
         arg: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> Result<()> {
-        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros() as i128;
         let handle = Python::attach(|py| {
             Py::new(
                 py,
@@ -632,7 +634,7 @@ impl EventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> Result<()> {
-        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+        let when = (Instant::now().duration_since(self.epoch) + delay).as_micros() as i128;
         let handle = Python::attach(|py| {
             Py::new(
                 py,
@@ -659,7 +661,7 @@ impl EventLoop {
     pub fn schedule_handle(&self, handle: impl Handle + Send + 'static, delay: Option<Duration>) -> Result<()> {
         match delay {
             Some(delay) => {
-                let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
+                let when = (Instant::now().duration_since(self.epoch) + delay).as_micros() as i128;
                 let timer = Timer {
                     handle: Box::new(handle),
                     when,
@@ -967,12 +969,12 @@ impl EventLoop {
     fn _call_later(
         &self,
         py: Python,
-        delay: u64,
+        delay: i64,
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Py<PyAny>,
     ) -> TimerHandle {
-        let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
+        let when = (Instant::now().duration_since(self.epoch).as_micros() as i128) + i128::from(delay);
         let handle = Py::new(py, CBHandle::new(callback, args, context)).unwrap();
         let timer = Timer {
             handle: Box::new(handle.clone_ref(py)),

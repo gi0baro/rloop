@@ -179,7 +179,7 @@ pub(crate) struct TimerHandle {
 
 impl TimerHandle {
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn new(handle: Py<CBHandle>, when: u128) -> Self {
+    pub(crate) fn new(handle: Py<CBHandle>, when: i128) -> Self {
         Self {
             handle,
             when: (when as f64) / 1_000_000.0,
