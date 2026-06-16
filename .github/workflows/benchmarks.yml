@@ -30,7 +30,7 @@ jobs:
       run: |
         python benchmarks.py raw stream proto
     - name: upload results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: results-base
         path: benchmarks/results/*
@@ -76,7 +76,7 @@ jobs:
         BENCHMARK_EXC_PREFIX=${{ github.workspace }}/.venv313/bin ${{ github.workspace }}/.venv313/bin/python benchmarks.py raw
         mv results/data.json results/py313.json
     - name: upload results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: results-pyver
         path: benchmarks/results/*
