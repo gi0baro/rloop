@@ -103,10 +103,11 @@ impl EventLoop {
             let guard_sched = self.handles_sched.lock().unwrap();
             if let Some(timer) = guard_sched.peek() {
                 let tick = Instant::now().duration_since(self.epoch).as_micros();
-                if timer.when > tick {
-                    let dt = (timer.when - tick) as u64;
-                    sched_time = Some(dt);
-                }
+                // NOTE: an already-due timer (when <= tick) must produce a non-blocking poll,
+                //       so we fall through to the timer block in this same step. Leaving
+                //       `sched_time` as `None` here would block `poll` indefinitely until
+                //       unrelated I/O woke us, stranding the due timer.
+                sched_time = Some(if timer.when > tick { (timer.when - tick) as u64 } else { 0 });
             }
         }
 
