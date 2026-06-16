@@ -1,4 +1,5 @@
 import threading
+import time
 
 
 def run_loop(loop):
@@ -60,6 +61,42 @@ def test_call_at(loop):
     dt = loop.time() - t0
 
     assert dt >= delay
+
+
+def test_call_later_due_without_io(loop):
+    # Regression: a timer that becomes due while the loop has no ready callbacks
+    # and no I/O sources to wake the poll must still fire promptly. Previously the
+    # poll timeout was left unbounded (None) for an already-due timer, so the loop
+    # blocked indefinitely until unrelated I/O happened to wake it.
+    fired = []
+
+    def victim():
+        fired.append(loop.time())
+        loop.stop()
+
+    def busy():
+        # Burn enough wall-clock that `victim` is overdue by the time the loop
+        # reaches the next step, which is idle (no ready callbacks, no I/O).
+        time.sleep(0.1)
+
+    # Safety net: if the bug is present the loop blocks forever, so force a stop
+    # from another thread (call_soon_threadsafe wakes the poll). The timing
+    # assertion below is what actually distinguishes buggy from fixed.
+    def watchdog():
+        time.sleep(2.0)
+        loop.call_soon_threadsafe(loop.stop)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    t0 = loop.time()
+    loop.call_later(0.01, victim)
+    loop.call_soon(busy)
+    loop.run_forever()
+
+    assert fired, 'timer never fired'
+    # With the fix `victim` fires right after `busy` returns (~0.1s). With the bug
+    # it only fires once the watchdog wakes the loop (~2s).
+    assert fired[0] - t0 < 1.0
 
 
 def test_call_soon_threadsafe(loop):

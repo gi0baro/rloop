@@ -107,7 +107,11 @@ impl EventLoop {
                 //       so we fall through to the timer block in this same step. Leaving
                 //       `sched_time` as `None` here would block `poll` indefinitely until
                 //       unrelated I/O woke us, stranding the due timer.
-                sched_time = Some(if timer.when > tick { (timer.when - tick) as u64 } else { 0 });
+                sched_time = Some(if timer.when > tick {
+                    (timer.when - tick) as u64
+                } else {
+                    0
+                });
             }
         }
 
