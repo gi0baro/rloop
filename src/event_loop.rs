@@ -45,6 +45,7 @@ pub struct EventLoopRunState {
     buf: Box<[u8]>,
     events: event::Events,
     pub read_buf: Box<[u8]>,
+    ready: VecDeque<BoxedHandle>,
     tick_last: u128,
 }
 
@@ -141,10 +142,11 @@ impl EventLoop {
             res
         };
 
-        let mut cb_handles = {
+        let mut cb_handles = mem::take(&mut state.ready);
+        {
             let mut guard_cb = self.handles_ready.lock().unwrap();
-            mem::replace(&mut *guard_cb, VecDeque::with_capacity(128))
-        };
+            mem::swap(&mut *guard_cb, &mut cb_handles);
+        }
         self.counter_ready
             .fetch_sub(cb_handles.len(), atomic::Ordering::Release);
 
@@ -186,6 +188,8 @@ impl EventLoop {
                 handle.run(py, self, state);
             }
         }
+
+        state.ready = cb_handles;
 
         poll_result
     }
@@ -1242,6 +1246,7 @@ impl EventLoop {
             buf: vec![0; 4096].into_boxed_slice(),
             events: event::Events::with_capacity(128),
             read_buf: vec![0; 262_144].into_boxed_slice(),
+            ready: VecDeque::with_capacity(128),
             tick_last: 0,
         };
 
