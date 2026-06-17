@@ -164,6 +164,9 @@ impl TCPTransport {
         lfd: Option<usize>,
     ) -> Self {
         let fd = stream.as_raw_fd() as usize;
+        if socket_family == libc::AF_INET || socket_family == libc::AF_INET6 {
+            _ = stream.set_nodelay(true);
+        }
         let state = TCPTransportState {
             stream,
             write_buf: VecDeque::new(),
