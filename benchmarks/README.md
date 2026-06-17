@@ -1,9 +1,9 @@
 # RLoop benchmarks
 
-Run at: Wed 20 Aug 2025, 17:47    
+Run at: Wed 17 Jun 2026, 13:46    
 Environment: GHA Linux x86_64 (CPUs: 4)    
 Python version: 3.13    
-RLoop version: 0.1.6    
+RLoop version: 0.3.0    
 
 ### Raw sockets
 
@@ -12,36 +12,36 @@ TCP echo server with raw sockets comparison using 1KB, 10KB and 100KB messages.
 
 | Loop | Throughput (1KB) | Throughput (10KB) | Throughput (100KB) |
 | --- | --- | --- | --- |
-| asyncio | 14410.8 (87.5%) | 13549.6 (89.1%) | 9882.8 (116.5%) | 
-| rloop | 16472.2 (100.0%) | 15214.9 (100.0%) | 8485.9 (100.0%) | 
-| uvloop | 15889.1 (96.5%) | 14276.3 (93.8%) | 9376.6 (110.5%) | 
+| asyncio | 12965.5 (88.9%) | 12003.9 (87.0%) | 8422.1 (117.0%) | 
+| rloop | 14587.3 (100.0%) | 13792.4 (100.0%) | 7200.1 (100.0%) | 
+| uvloop | 13669.7 (93.7%) | 12373.4 (89.7%) | 9116.8 (126.6%) | 
 
 
 #### 1KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 144108 | 14410.8 (87.5%) | 0.068ms | 0.105ms | 0.012 |
-| rloop | 164722 | 16472.2 (100.0%) | 0.058ms | 0.089ms | 0.011 |
-| uvloop | 158891 | 15889.1 (96.5%) | 0.06ms | 0.1ms | 0.014 |
+| asyncio | 129655 | 12965.5 (88.9%) | 0.076ms | 0.114ms | 0.013 |
+| rloop | 145873 | 14587.3 (100.0%) | 0.065ms | 0.099ms | 0.012 |
+| uvloop | 136697 | 13669.7 (93.7%) | 0.07ms | 0.11ms | 0.018 |
 
 
 #### 10KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 135496 | 13549.6 (89.1%) | 0.071ms | 0.113ms | 0.02 |
-| rloop | 152149 | 15214.9 (100.0%) | 0.063ms | 0.1ms | 0.014 |
-| uvloop | 142763 | 14276.3 (93.8%) | 0.068ms | 0.109ms | 0.014 |
+| asyncio | 120039 | 12003.9 (87.0%) | 0.08ms | 0.127ms | 0.018 |
+| rloop | 137924 | 13792.4 (100.0%) | 0.07ms | 0.109ms | 0.013 |
+| uvloop | 123734 | 12373.4 (89.7%) | 0.077ms | 0.119ms | 0.019 |
 
 
 #### 100KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 98828 | 9882.8 (116.5%) | 0.1ms | 0.143ms | 0.014 |
-| rloop | 84859 | 8485.9 (100.0%) | 0.115ms | 0.24ms | 0.032 |
-| uvloop | 93766 | 9376.6 (110.5%) | 0.103ms | 0.166ms | 0.019 |
+| asyncio | 84221 | 8422.1 (117.0%) | 0.116ms | 0.151ms | 0.02 |
+| rloop | 72001 | 7200.1 (100.0%) | 0.135ms | 0.268ms | 0.036 |
+| uvloop | 91168 | 9116.8 (126.6%) | 0.106ms | 0.153ms | 0.02 |
 
 
 ### Streams
@@ -51,36 +51,36 @@ TCP echo server with `asyncio` streams comparison using 1KB, 10KB and 100KB mess
 
 | Loop | Throughput (1KB) | Throughput (10KB) | Throughput (100KB) |
 | --- | --- | --- | --- |
-| asyncio | 14196.4 (86.6%) | 12849.9 (87.1%) | 5915.2 (82.6%) | 
-| rloop | 16401.5 (100.0%) | 14751.1 (100.0%) | 7161.5 (100.0%) | 
-| uvloop | 14735.5 (89.8%) | 13427.1 (91.0%) | 6186.9 (86.4%) | 
+| asyncio | 11919.7 (88.6%) | 10894.9 (83.1%) | 7489.6 (113.3%) | 
+| rloop | 13446.9 (100.0%) | 13109.9 (100.0%) | 6611.8 (100.0%) | 
+| uvloop | 12555.7 (93.4%) | 11669.4 (89.0%) | 6518.7 (98.6%) | 
 
 
 #### 1KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 141964 | 14196.4 (86.6%) | 0.067ms | 0.101ms | 0.011 |
-| rloop | 164015 | 16401.5 (100.0%) | 0.057ms | 0.089ms | 0.01 |
-| uvloop | 147355 | 14735.5 (89.8%) | 0.067ms | 0.097ms | 0.012 |
+| asyncio | 119197 | 11919.7 (88.6%) | 0.08ms | 0.11ms | 0.014 |
+| rloop | 134469 | 13446.9 (100.0%) | 0.07ms | 0.1ms | 0.013 |
+| uvloop | 125557 | 12555.7 (93.4%) | 0.076ms | 0.107ms | 0.011 |
 
 
 #### 10KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 128499 | 12849.9 (87.1%) | 0.075ms | 0.108ms | 0.012 |
-| rloop | 147511 | 14751.1 (100.0%) | 0.066ms | 0.096ms | 0.01 |
-| uvloop | 134271 | 13427.1 (91.0%) | 0.072ms | 0.105ms | 0.012 |
+| asyncio | 108949 | 10894.9 (83.1%) | 0.089ms | 0.12ms | 0.013 |
+| rloop | 131099 | 13109.9 (100.0%) | 0.074ms | 0.105ms | 0.01 |
+| uvloop | 116694 | 11669.4 (89.0%) | 0.082ms | 0.111ms | 0.013 |
 
 
 #### 100KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 59152 | 5915.2 (82.6%) | 0.166ms | 0.236ms | 0.035 |
-| rloop | 71615 | 7161.5 (100.0%) | 0.136ms | 0.197ms | 0.027 |
-| uvloop | 61869 | 6186.9 (86.4%) | 0.159ms | 0.237ms | 0.038 |
+| asyncio | 74896 | 7489.6 (113.3%) | 0.129ms | 0.165ms | 0.019 |
+| rloop | 66118 | 6611.8 (100.0%) | 0.149ms | 0.216ms | 0.027 |
+| uvloop | 65187 | 6518.7 (98.6%) | 0.15ms | 0.217ms | 0.027 |
 
 
 ### Protocol
@@ -90,36 +90,36 @@ TCP echo server with `asyncio.Protocol` comparison using 1KB, 10KB and 100KB mes
 
 | Loop | Throughput (1KB) | Throughput (10KB) | Throughput (100KB) |
 | --- | --- | --- | --- |
-| asyncio | 17784.4 (85.3%) | 16494.6 (85.8%) | 11408.8 (96.0%) | 
-| rloop | 20838.8 (100.0%) | 19225.1 (100.0%) | 11881.8 (100.0%) | 
-| uvloop | 20296.3 (97.4%) | 18002.2 (93.6%) | 8027.6 (67.6%) | 
+| asyncio | 14832.5 (86.2%) | 13257.1 (83.9%) | 10077.2 (99.0%) | 
+| rloop | 17203.8 (100.0%) | 15799.2 (100.0%) | 10177.2 (100.0%) | 
+| uvloop | 16483.9 (95.8%) | 15163.6 (96.0%) | 10373.0 (101.9%) | 
 
 
 #### 1KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 177844 | 17784.4 (85.3%) | 0.054ms | 0.081ms | 0.007 |
-| rloop | 208388 | 20838.8 (100.0%) | 0.045ms | 0.069ms | 0.007 |
-| uvloop | 202963 | 20296.3 (97.4%) | 0.046ms | 0.07ms | 0.009 |
+| asyncio | 148325 | 14832.5 (86.2%) | 0.066ms | 0.09ms | 0.01 |
+| rloop | 172038 | 17203.8 (100.0%) | 0.057ms | 0.08ms | 0.01 |
+| uvloop | 164839 | 16483.9 (95.8%) | 0.056ms | 0.083ms | 0.01 |
 
 
 #### 10KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 164946 | 16494.6 (85.8%) | 0.057ms | 0.088ms | 0.01 |
-| rloop | 192251 | 19225.1 (100.0%) | 0.05ms | 0.072ms | 0.008 |
-| uvloop | 180022 | 18002.2 (93.6%) | 0.054ms | 0.08ms | 0.007 |
+| asyncio | 132571 | 13257.1 (83.9%) | 0.071ms | 0.099ms | 0.013 |
+| rloop | 157992 | 15799.2 (100.0%) | 0.06ms | 0.088ms | 0.01 |
+| uvloop | 151636 | 15163.6 (96.0%) | 0.064ms | 0.09ms | 0.011 |
 
 
 #### 100KB details
 
 | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-| asyncio | 114088 | 11408.8 (96.0%) | 0.085ms | 0.121ms | 0.01 |
-| rloop | 118818 | 11881.8 (100.0%) | 0.081ms | 0.112ms | 0.009 |
-| uvloop | 80276 | 8027.6 (67.6%) | 0.122ms | 0.157ms | 0.01 |
+| asyncio | 100772 | 10077.2 (99.0%) | 0.096ms | 0.129ms | 0.013 |
+| rloop | 101772 | 10177.2 (100.0%) | 0.095ms | 0.126ms | 0.014 |
+| uvloop | 103730 | 10373.0 (101.9%) | 0.092ms | 0.12ms | 0.015 |
 
 
 ### Other benchmarks
