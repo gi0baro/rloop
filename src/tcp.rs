@@ -566,15 +566,25 @@ impl TCPReadHandle {
 
     #[inline]
     fn recv_buffered(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool) {
-        // NOTE: `PuBuffer.as_mut_slice` exists, but it returns a slice of `Cell<u8>`,
-        //       which is smth we can't really use to read from `TcpStream`.
-        //       So even if this sucks, we copy data back and forth, at least until
-        //       we figure out a way to actually use `PyBuffer` directly.
         let pybuf: PyBuffer<u8> = PyBuffer::get(&transport.protom_buf_get.bind(py).call1((-1,)).unwrap()).unwrap();
-        let mut vbuf = pybuf.to_vec(py).unwrap();
-        let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, vbuf.as_mut_slice());
+
+        let (read, closed) = if pybuf.is_c_contiguous() && !pybuf.readonly() {
+            // Read straight into the protocol's buffer, no intermediate allocation or
+            // copy. The GIL is held for the whole call, so nothing else can touch the
+            // buffer concurrently, and we only access it through this slice.
+            let buf = unsafe { std::slice::from_raw_parts_mut(pybuf.buf_ptr().cast::<u8>(), pybuf.len_bytes()) };
+            self.read_into(&mut transport.state.borrow_mut().stream, buf)
+        } else {
+            // Fallback for non-contiguous/read-only buffers: copy through a temp Vec.
+            let mut vbuf = pybuf.to_vec(py).unwrap();
+            let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, vbuf.as_mut_slice());
+            if read > 0 {
+                _ = pybuf.copy_from_slice(py, &vbuf[..read]);
+            }
+            (read, closed)
+        };
+
         if read > 0 {
-            _ = pybuf.copy_from_slice(py, &vbuf[..]);
             return (Some(read.into_py_any(py).unwrap()), closed);
         }
         (None, closed)
