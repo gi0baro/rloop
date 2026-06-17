@@ -1,5 +1,6 @@
 import asyncio as __asyncio
 import errno
+import logging
 import os
 import signal
 import socket
@@ -30,6 +31,9 @@ from .subprocess import (
     _ThreadedChildWatcher,
 )
 from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_info, _noop, _set_reuseport
+
+
+logger = logging.getLogger(__name__)
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
@@ -316,10 +320,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         interleave=None,
         all_errors=False,
     ):
-        # TODO
-        if ssl:
-            raise NotImplementedError
-
         if server_hostname is not None and not ssl:
             raise ValueError('server_hostname is only meaningful with ssl')
 
@@ -385,7 +385,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                         happy_eyeballs_delay,
                         loop=self,
                     )
-                )[0]  # can't use sock, _, _ as it keeks a reference to exceptions
+                )[0]  # can't use sock, _, _ as it keeps a reference to exceptions
 
             if sock is None:
                 exceptions = [exc for sub in exceptions for exc in sub]
@@ -421,16 +421,8 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         rsock = (sock.fileno(), sock.family)
         sock.detach()
 
-        # TODO: ssl
-        transport, protocol = self._tcp_conn(rsock, protocol_factory)
-        # transport, protocol = await self._create_connection_transport(
-        #     sock,
-        #     protocol_factory,
-        #     ssl,
-        #     server_hostname,
-        #     ssl_handshake_timeout=ssl_handshake_timeout,
-        #     ssl_shutdown_timeout=ssl_shutdown_timeout,
-        # )
+        logger.debug('Creating %s connection', 'SSL' if ssl else 'TCP')
+        transport, protocol = self._tcp_conn(rsock, protocol_factory, ssl, server_hostname if ssl else None)
 
         return transport, protocol
 
@@ -491,10 +483,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         ssl_shutdown_timeout=None,
         start_serving=True,
     ):
-        # TODO
-        if ssl:
-            raise NotImplementedError
-
         if isinstance(ssl, bool):
             raise TypeError('ssl argument must be an SSLContext or None')
 
@@ -580,11 +568,12 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             rsocks.append((sock.fileno(), sock.family))
             sock.detach()
 
-        # TODO: ssl
-        # server = self._tcp_server(sockets, rsocks, protocol_factory, backlog,
-        #                 ssl, ssl_handshake_timeout,
-        #                 ssl_shutdown_timeout)
-        server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
+        if ssl:
+            logger.debug('Creating SSL server')
+            server = Server(self._tcp_server_ssl(sockets, rsocks, protocol_factory, backlog, ssl))
+        else:
+            logger.debug('Creating TCP server')
+            server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
 
         if start_serving:
             await server.start_serving()

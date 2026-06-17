@@ -351,6 +351,7 @@ impl EventLoop {
                         let guard_poll = self.io.lock().unwrap();
                         _ = guard_poll.registry().reregister(&mut source, token, interests);
                     }
+                    self.wake(); // interest changed
                     return IOHandle::TCPStream(interests);
                 }
                 unreachable!()
@@ -362,6 +363,7 @@ impl EventLoop {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
                 }
+                self.wake(); // interest registered
                 IOHandle::TCPStream(interest)
             },
         );
@@ -401,16 +403,20 @@ impl EventLoop {
 
     #[inline(always)]
     pub(crate) fn tcp_stream_close(&self, py: Python, fd: usize) {
-        if let Some(transport) = self.tcp_transports.pin().remove(&fd)
-            && let Some(lfd) = transport.borrow(py).lfd
-        {
-            self.tcp_lstreams.pin().get(&lfd).map(|v| v.pin().remove(&fd));
+        if let Some(transport) = self.tcp_transports.pin().remove(&fd) {
+            // ensure TCPTransport::close() called, as it sends TLS close
+            if transport.borrow(py).is_tls() {
+                transport.borrow(py).close(py);
+            }
+            if let Some(lfd) = transport.borrow(py).lfd {
+                self.tcp_lstreams.pin().get(&lfd).map(|v| v.pin().remove(&fd));
+            }
         }
     }
 
     #[inline(always)]
-    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Py<TCPTransport> {
-        self.tcp_transports.pin().get(&fd).unwrap().clone_ref(py)
+    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Option<Py<TCPTransport>> {
+        self.tcp_transports.pin().get(&fd).map(|t| t.clone_ref(py))
     }
 
     pub(crate) fn with_tcp_listener_streams<T>(&self, fd: usize, func: T)
@@ -1176,10 +1182,19 @@ impl EventLoop {
         py: Python,
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
+        ssl_context: Option<Py<PyAny>>,
+        server_hostname: Option<String>,
     ) -> PyResult<(Py<TCPTransport>, Py<PyAny>)> {
         let rself = pyself.get();
         let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
         let fd = transport.fd;
+
+        if let (Some(ssl_context), Some(server_hostname)) = (ssl_context, server_hostname) {
+            // Initialize TLS client connection
+            let ssl_config = crate::ssl::create_ssl_client_config_from_context(&ssl_context.bind(py))?;
+            transport.initialize_tls_client(ssl_config, server_hostname);
+        }
+
         let pytransport = Py::new(py, transport)?;
         let proto = TCPTransport::attach(&pytransport, py)?;
         rself.tcp_transports.pin().insert(fd, pytransport.clone_ref(py));
@@ -1198,6 +1213,30 @@ impl EventLoop {
         let mut servers = Vec::new();
         for (fd, family) in rsocks {
             servers.push(TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        Py::new(py, server)
+    }
+
+    fn _tcp_server_ssl(
+        pyself: Py<Self>,
+        py: Python,
+        socks: Py<PyAny>,
+        rsocks: Vec<(i32, i32)>,
+        protocol_factory: Py<PyAny>,
+        backlog: i32,
+        ssl_context: Py<PyAny>,
+    ) -> PyResult<Py<Server>> {
+        let ssl_config = crate::ssl::create_ssl_config_from_context(&ssl_context.bind(py))?;
+        let mut servers = Vec::new();
+        for (fd, family) in rsocks {
+            servers.push(TCPServer::from_fd_ssl(
+                fd,
+                family,
+                backlog,
+                protocol_factory.clone_ref(py),
+                ssl_config.clone(),
+            ));
         }
         let server = Server::tcp(pyself.clone_ref(py), socks, servers);
         Py::new(py, server)

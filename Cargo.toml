@@ -31,9 +31,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "=1.0"
+env_logger = "0.11"
+log = "0.4"
 mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
 papaya = "=0.2"
 pyo3 = { version = "=0.26", features = ["anyhow", "extension-module", "generate-import-lib"] }
+rcgen = "=0.13"
+rustls = { version = "0.23", features = ["std"] }
+rustls-pemfile = "2.0"
 socket2 = { version = "=0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
