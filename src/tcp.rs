@@ -24,6 +24,11 @@ use crate::{
     utils::syscall,
 };
 
+// PyO3 removed private CPython's APIs
+unsafe extern "C" {
+    fn _PyBytes_Resize(bytes: *mut *mut pyo3::ffi::PyObject, newsize: pyo3::ffi::Py_ssize_t) -> std::os::raw::c_int;
+}
+
 pub(crate) struct TCPServer {
     pub fd: i32,
     sfamily: i32,
@@ -557,25 +562,41 @@ pub(crate) struct TCPReadHandle {
 
 impl TCPReadHandle {
     #[inline]
-    fn recv_direct(&self, py: Python, transport: &TCPTransport, buf: &mut [u8]) -> (Option<Py<PyAny>>, bool) {
+    fn recv_direct(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool, bool) {
+        const BUF_MAXSIZE: usize = 262_144;
+        //: alloc an uninitialized `PyBytes` and read into it: single copy (kernel -> bytes), matching asyncio/CPython's `sock.recv`
+        let mut obj =
+            unsafe { pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), BUF_MAXSIZE as pyo3::ffi::Py_ssize_t) };
+        if obj.is_null() {
+            unsafe { pyo3::ffi::PyErr_Clear() };
+            return (None, false, false);
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(pyo3::ffi::PyBytes_AsString(obj).cast::<u8>(), BUF_MAXSIZE) };
+
         let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, buf);
         if read > 0 {
-            let rbuf = &buf[..read];
-            let pydata = unsafe { PyBytes::from_ptr(py, rbuf.as_ptr(), read) };
-            return (Some(pydata.into_any().unbind()), closed);
+            if read < BUF_MAXSIZE && unsafe { _PyBytes_Resize(&mut obj, read as pyo3::ffi::Py_ssize_t) } != 0 {
+                unsafe { pyo3::ffi::PyErr_Clear() };
+                return (None, closed, false);
+            }
+            let pydata = unsafe { Bound::from_owned_ptr(py, obj).unbind() };
+            // `read == BUF_MAXSIZE` means the buffer filled, so more data may be waiting.
+            return (Some(pydata), closed, read == BUF_MAXSIZE);
         }
-        (None, closed)
+        unsafe { pyo3::ffi::Py_DECREF(obj) };
+        (None, closed, false)
     }
 
     #[inline]
-    fn recv_buffered(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool) {
+    fn recv_buffered(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool, bool) {
         let pybuf: PyBuffer<u8> = PyBuffer::get(&transport.protom_buf_get.bind(py).call1((-1,)).unwrap()).unwrap();
+        let max_len = pybuf.len_bytes();
 
         let (read, closed) = if pybuf.is_c_contiguous() && !pybuf.readonly() {
             // Read straight into the protocol's buffer, no intermediate allocation or
             // copy. The GIL is held for the whole call, so nothing else can touch the
             // buffer concurrently, and we only access it through this slice.
-            let buf = unsafe { std::slice::from_raw_parts_mut(pybuf.buf_ptr().cast::<u8>(), pybuf.len_bytes()) };
+            let buf = unsafe { std::slice::from_raw_parts_mut(pybuf.buf_ptr().cast::<u8>(), max_len) };
             self.read_into(&mut transport.state.borrow_mut().stream, buf)
         } else {
             // Fallback for non-contiguous/read-only buffers: copy through a temp Vec.
@@ -588,9 +609,9 @@ impl TCPReadHandle {
         };
 
         if read > 0 {
-            return (Some(read.into_py_any(py).unwrap()), closed);
+            return (Some(read.into_py_any(py).unwrap()), closed, read == max_len);
         }
-        (None, closed)
+        (None, closed, false)
     }
 
     #[inline(always)]
@@ -628,7 +649,7 @@ impl TCPReadHandle {
 }
 
 impl Handle for TCPReadHandle {
-    fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let pytransport = event_loop.get_tcp_transport(self.fd, py);
         let transport = pytransport.borrow(py);
 
@@ -636,14 +657,14 @@ impl Handle for TCPReadHandle {
         //       otherwise we won't get another readable event from the poller
         let mut close = false;
         loop {
-            let (data, eof) = match transport.proto_buffered {
+            let (data, eof, full) = match transport.proto_buffered {
                 true => self.recv_buffered(py, &transport),
-                false => self.recv_direct(py, &transport, &mut state.read_buf),
+                false => self.recv_direct(py, &transport),
             };
 
             if let Some(data) = data {
                 _ = transport.protom_recv_data.call1(py, (data,));
-                if !eof {
+                if !eof && full {
                     continue;
                 }
             }
