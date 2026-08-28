@@ -52,7 +52,6 @@ impl CBHandle {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn new0(callback: Py<PyAny>, context: Py<PyAny>) -> CBHandleNoArgs {
         CBHandleNoArgs {
             callback,
@@ -94,6 +93,29 @@ macro_rules! cbhandle_cancelled_impl {
 cbhandle_cancel_impl!(CBHandle);
 cbhandle_cancel_impl!(CBHandleNoArgs);
 cbhandle_cancel_impl!(CBHandleOneArg);
+
+macro_rules! cb_handle_match_args {
+    ($py:expr, $callback:expr, $args:expr, $context:expr) => {{
+        let (handle, bhandle): (Py<PyAny>, BoxedHandle) = match $args.len() {
+            0 => {
+                let h = Py::new($py, CBHandle::new0($callback, $context)).unwrap();
+                (h.clone_ref($py).into_any(), Box::new(h) as BoxedHandle)
+            }
+            1 => {
+                let arg = $args.get_item(0).unwrap().unbind();
+                let h = Py::new($py, CBHandle::new1($callback, arg, $context)).unwrap();
+                (h.clone_ref($py).into_any(), Box::new(h) as BoxedHandle)
+            }
+            _ => {
+                let h = Py::new($py, CBHandle::new($callback, $args.clone().unbind().into_any(), $context)).unwrap();
+                (h.clone_ref($py).into_any(), Box::new(h) as BoxedHandle)
+            }
+        };
+        (handle, bhandle)
+    }};
+}
+
+pub(crate) use cb_handle_match_args;
 
 impl Handle for Py<CBHandle> {
     cbhandle_cancelled_impl!();

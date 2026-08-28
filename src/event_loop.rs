@@ -12,7 +12,7 @@ use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
 use crate::{
-    handles::{BoxedHandle, CBHandle, Handle, TimerHandle},
+    handles::{BoxedHandle, CBHandle, Handle, TimerHandle, cb_handle_match_args},
     io::Source,
     log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
@@ -934,13 +934,15 @@ impl EventLoop {
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> Py<CBHandle> {
-        let handle = Py::new(
-            py,
-            CBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py))),
-        )
-        .unwrap();
-        let bhandle = Box::new(handle.clone_ref(py));
+    fn call_soon(
+        &self,
+        py: Python,
+        callback: Py<PyAny>,
+        args: &Bound<pyo3::types::PyTuple>,
+        context: Option<Py<PyAny>>,
+    ) -> Py<PyAny> {
+        let context = context.unwrap_or_else(|| copy_context(py));
+        let (handle, bhandle) = cb_handle_match_args!(py, callback, args, context);
         {
             let mut guard = self.handles_ready.lock().unwrap();
             guard.push_back(bhandle);
@@ -955,16 +957,11 @@ impl EventLoop {
         &self,
         py: Python,
         callback: Py<PyAny>,
-        args: Py<PyAny>,
+        args: &Bound<pyo3::types::PyTuple>,
         context: Option<Py<PyAny>>,
-    ) -> Py<CBHandle> {
-        let handle = Py::new(
-            py,
-            CBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
-        )
-        .unwrap();
-        let bhandle = Box::new(handle.clone_ref(py));
-
+    ) -> Py<PyAny> {
+        let context = context.unwrap_or_else(|| self._base_ctx.clone_ref(py));
+        let (handle, bhandle) = cb_handle_match_args!(py, callback, args, context);
         {
             let mut guard = self.handles_ready.lock().unwrap();
             guard.push_back(bhandle);
