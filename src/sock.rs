@@ -22,6 +22,10 @@ impl SocketWrapper {
         )
         .unwrap()
     }
+
+    pub(crate) fn detach_inner(&self, py: Python) {
+        _ = self.sock.call_method0(py, pyo3::intern!(py, "detach"));
+    }
 }
 
 #[pymethods]

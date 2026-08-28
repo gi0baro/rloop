@@ -95,6 +95,12 @@ impl TCPServer {
     }
 }
 
+impl Drop for TCPTransport {
+    fn drop(&mut self) {
+        Python::attach(|py| self.sock.get().detach_inner(py));
+    }
+}
+
 pub(crate) struct TCPServerRef {
     pub fd: usize,
     pyloop: Py<EventLoop>,

@@ -47,6 +47,12 @@ pub(crate) struct UDPTransport {
     sock: Py<SocketWrapper>,
 }
 
+impl Drop for UDPTransport {
+    fn drop(&mut self) {
+        Python::attach(|py| self.sock.get().detach_inner(py));
+    }
+}
+
 impl UDPTransport {
     fn new(
         py: Python,
