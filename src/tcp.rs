@@ -74,7 +74,9 @@ impl TCPServer {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    transports.push(transport);
+                }
             }
         });
         for transport in transports {
@@ -86,7 +88,9 @@ impl TCPServer {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    transports.push(transport);
+                }
             }
         });
         for transport in transports {
@@ -200,6 +204,7 @@ pub(crate) struct TCPTransport {
     pyloop: Py<EventLoop>,
     // atomics
     closing: atomic::AtomicBool,
+    conn_lost: atomic::AtomicBool,
     paused: atomic::AtomicBool,
     water_hi: atomic::AtomicUsize,
     water_lo: atomic::AtomicUsize,
@@ -262,6 +267,7 @@ impl TCPTransport {
             water_hi: wh.into(),
             water_lo: wl.into(),
             weof: false.into(),
+            conn_lost: false.into(),
             proto,
             proto_buffered,
             proto_paused: false.into(),
@@ -320,23 +326,16 @@ impl TCPTransport {
         }
 
         event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-        _ = self.protom_conn_lost.call1(py, (py.None(),));
+        self.call_conn_lost(py, None);
         true
     }
 
     #[inline]
     fn close_from_write_handle(&self, py: Python, errored: bool) -> Option<bool> {
         if self.closing.load(atomic::Ordering::Relaxed) {
-            _ = self.protom_conn_lost.call1(
+            self.call_conn_lost(
                 py,
-                #[allow(clippy::obfuscated_if_else)]
-                (errored
-                    .then(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")
-                            .into_py_any(py)
-                            .unwrap()
-                    })
-                    .unwrap_or_else(|| py.None()),),
+                errored.then(|| pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")),
             );
             return Some(true);
         }
@@ -345,6 +344,18 @@ impl TCPTransport {
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
+        if self
+            .conn_lost
+            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.write_buf.clear();
+            state.write_buf_dsize = 0;
+        }
         _ = self.protom_conn_lost.call1(py, (err,));
         self.pyloop.get().tcp_stream_close(py, self.fd);
     }
@@ -360,6 +371,7 @@ impl TCPTransport {
         }
 
         let mut state = rself.state.borrow_mut();
+        let mut conn_err = None;
         let buf_added = match state.write_buf_dsize {
             #[allow(clippy::cast_possible_wrap)]
             0 => match syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
@@ -388,7 +400,7 @@ impl TCPTransport {
                     {
                         rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
                     }
-                    rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
+                    conn_err = Some(err);
                     0
                 }
             },
@@ -410,6 +422,11 @@ impl TCPTransport {
             {
                 Self::proto_pause(pyself, py);
             }
+        }
+        drop(state);
+
+        if let Some(err) = conn_err {
+            rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
         }
 
         Ok(())
@@ -477,8 +494,8 @@ impl TCPTransport {
 
         let event_loop = self.pyloop.get();
         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-        if self.state.borrow().write_buf_dsize == 0 {
-            // set conn lost?
+        let buf_empty = self.state.borrow().write_buf_dsize == 0;
+        if buf_empty {
             event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
             self.call_conn_lost(py, None);
         }
@@ -625,7 +642,7 @@ impl TCPTransport {
 }
 
 pub(crate) struct TCPReadHandle {
-    pub fd: usize,
+    pub transport: Py<TCPTransport>,
 }
 
 impl TCPReadHandle {
@@ -708,7 +725,7 @@ impl TCPReadHandle {
 
     #[inline]
     fn recv_eof(&self, py: Python, event_loop: &EventLoop, transport: &TCPTransport) -> bool {
-        event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+        event_loop.tcp_stream_rem(transport.fd, Interest::READABLE);
         if let Ok(pyr) = transport.proto.call_method0(py, pyo3::intern!(py, "eof_received"))
             && let Ok(true) = pyr.is_truthy(py)
         {
@@ -720,8 +737,10 @@ impl TCPReadHandle {
 
 impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
+        let transport = self.transport.borrow(py);
+        if transport.conn_lost.load(atomic::Ordering::Relaxed) {
+            return;
+        }
 
         // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
         //       otherwise we won't get another readable event from the poller
@@ -747,13 +766,13 @@ impl Handle for TCPReadHandle {
         }
 
         if close {
-            event_loop.tcp_stream_close(py, self.fd);
+            event_loop.tcp_stream_close(py, transport.fd);
         }
     }
 }
 
 pub(crate) struct TCPWriteHandle {
-    pub fd: usize,
+    pub transport: Py<TCPTransport>,
 }
 
 impl TCPWriteHandle {
@@ -762,7 +781,7 @@ impl TCPWriteHandle {
         const MAX_IOV: usize = 1024;
 
         #[allow(clippy::cast_possible_wrap)]
-        let fd = self.fd as i32;
+        let fd = transport.fd as i32;
         let mut ret = 0;
         let mut state = transport.state.borrow_mut();
         while !state.write_buf.is_empty() {
@@ -813,15 +832,18 @@ impl TCPWriteHandle {
 
 impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
+        let transport = self.transport.borrow(py);
+        if transport.conn_lost.load(atomic::Ordering::Relaxed) {
+            return;
+        }
         let stream_close;
 
         if let Some(written) = self.write(&transport, &mut state.iovecs) {
             if written > 0 {
-                TCPTransport::write_buf_size_decr(&pytransport, py);
+                TCPTransport::write_buf_size_decr(&self.transport, py);
             }
-            stream_close = match transport.state.borrow().write_buf.is_empty() {
+            let buf_empty = transport.state.borrow().write_buf.is_empty();
+            stream_close = match buf_empty {
                 true => transport.close_from_write_handle(py, false),
                 false => None,
             };
@@ -829,12 +851,13 @@ impl Handle for TCPWriteHandle {
             stream_close = transport.close_from_write_handle(py, true);
         }
 
-        if transport.state.borrow().write_buf.is_empty() {
-            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+        let buf_empty = transport.state.borrow().write_buf.is_empty();
+        if buf_empty {
+            event_loop.tcp_stream_rem(transport.fd, Interest::WRITABLE);
         }
 
         match stream_close {
-            Some(true) => event_loop.tcp_stream_close(py, self.fd),
+            Some(true) => event_loop.tcp_stream_close(py, transport.fd),
             Some(false) => {
                 _ = transport.state.borrow().stream.shutdown(std::net::Shutdown::Write);
             }

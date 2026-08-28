@@ -2,7 +2,7 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 
 use mio::{Interest, net::UdpSocket};
-use pyo3::{IntoPyObject, IntoPyObjectExt, prelude::*, types::PyBytes};
+use pyo3::{IntoPyObject, prelude::*, types::PyBytes};
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -34,6 +34,7 @@ pub(crate) struct UDPTransport {
     pyloop: Py<EventLoop>,
     // atomics
     closing: atomic::AtomicBool,
+    conn_lost: atomic::AtomicBool,
     water_hi: atomic::AtomicUsize,
     water_lo: atomic::AtomicUsize,
     // py protocol fields
@@ -86,6 +87,7 @@ impl UDPTransport {
             state: RefCell::new(state),
             pyloop,
             closing: false.into(),
+            conn_lost: false.into(),
             water_hi: wh.into(),
             water_lo: wl.into(),
             proto,
@@ -140,16 +142,9 @@ impl UDPTransport {
     #[inline]
     fn close_from_write_handle(&self, py: Python, errored: bool) -> bool {
         if self.closing.load(atomic::Ordering::Relaxed) {
-            _ = self.protom_conn_lost.call1(
+            self.call_conn_lost(
                 py,
-                #[allow(clippy::obfuscated_if_else)]
-                (errored
-                    .then(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")
-                            .into_py_any(py)
-                            .unwrap()
-                    })
-                    .unwrap_or_else(|| py.None()),),
+                errored.then(|| pyo3::exceptions::PyRuntimeError::new_err("socket transport failed")),
             );
             return true;
         }
@@ -158,6 +153,18 @@ impl UDPTransport {
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, exc: Option<PyErr>) {
+        if self
+            .conn_lost
+            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.write_buf.clear();
+            state.write_buf_dsize = 0;
+        }
         _ = self.protom_conn_lost.call1(py, (exc,));
     }
 
@@ -177,9 +184,10 @@ impl UDPTransport {
         let rself = pyself.borrow(py);
         let mut state = rself.state.borrow_mut();
 
+        let mut conn_err = None;
         let buf_added = match state.write_buf_dsize {
             0 => {
-                match rself.state.borrow().socket.send_to(data, addr) {
+                match state.socket.send_to(data, addr) {
                     Ok(written) if written == data.len() => 0,
                     Ok(written) => {
                         state.write_buf.push_back(((&data[written..]).into(), addr));
@@ -204,7 +212,7 @@ impl UDPTransport {
                         {
                             rself.pyloop.get().udp_socket_rem(rself.fd, Interest::READABLE);
                         }
-                        rself.call_conn_lost(py, Some(pyo3::exceptions::PyOSError::new_err(err.to_string())));
+                        conn_err = Some(err);
                         0
                     }
                 }
@@ -228,6 +236,11 @@ impl UDPTransport {
             {
                 Self::proto_pause(pyself, py);
             }
+        }
+        drop(state);
+
+        if let Some(err) = conn_err {
+            rself.call_conn_lost(py, Some(pyo3::exceptions::PyOSError::new_err(err.to_string())));
         }
     }
 
@@ -299,7 +312,8 @@ impl UDPTransport {
 
         let event_loop = self.pyloop.get();
         event_loop.udp_socket_rem(self.fd, Interest::READABLE);
-        if self.state.borrow().write_buf_dsize == 0 {
+        let buf_empty = self.state.borrow().write_buf_dsize == 0;
+        if buf_empty {
             event_loop.udp_socket_rem(self.fd, Interest::WRITABLE);
             self.call_conn_lost(py, None);
         }
@@ -402,13 +416,15 @@ impl UDPTransport {
 }
 
 pub(crate) struct UDPReadHandle {
-    pub fd: usize,
+    pub transport: Py<UDPTransport>,
 }
 
 impl Handle for UDPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_udp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
+        let transport = self.transport.borrow(py);
+        if transport.conn_lost.load(atomic::Ordering::Relaxed) {
+            return;
+        }
 
         loop {
             match {
@@ -431,7 +447,7 @@ impl Handle for UDPReadHandle {
                     // Other error - call error_received and close
                     let py_err = pyo3::exceptions::PyOSError::new_err(err.to_string());
                     transport.call_error_received(py, py_err);
-                    event_loop.udp_socket_close(self.fd);
+                    event_loop.udp_socket_close(transport.fd);
                     break;
                 }
             }
@@ -440,7 +456,7 @@ impl Handle for UDPReadHandle {
 }
 
 pub(crate) struct UDPWriteHandle {
-    pub fd: usize,
+    pub transport: Py<UDPTransport>,
 }
 
 impl UDPWriteHandle {
@@ -478,15 +494,18 @@ impl UDPWriteHandle {
 
 impl Handle for UDPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_udp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
+        let transport = self.transport.borrow(py);
+        if transport.conn_lost.load(atomic::Ordering::Relaxed) {
+            return;
+        }
         let stream_close;
 
         if let Some(written) = self.write(&transport) {
             if written > 0 {
-                UDPTransport::write_buf_size_decr(&pytransport, py);
+                UDPTransport::write_buf_size_decr(&self.transport, py);
             }
-            stream_close = match transport.state.borrow().write_buf.is_empty() {
+            let buf_empty = transport.state.borrow().write_buf.is_empty();
+            stream_close = match buf_empty {
                 true => transport.close_from_write_handle(py, false),
                 false => false,
             };
@@ -494,11 +513,12 @@ impl Handle for UDPWriteHandle {
             stream_close = transport.close_from_write_handle(py, true);
         }
 
-        if transport.state.borrow().write_buf.is_empty() {
-            event_loop.udp_socket_rem(self.fd, Interest::WRITABLE);
+        let buf_empty = transport.state.borrow().write_buf.is_empty();
+        if buf_empty {
+            event_loop.udp_socket_rem(transport.fd, Interest::WRITABLE);
         }
         if stream_close {
-            event_loop.udp_socket_close(self.fd);
+            event_loop.udp_socket_close(transport.fd);
         }
     }
 }

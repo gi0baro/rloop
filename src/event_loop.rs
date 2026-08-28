@@ -160,8 +160,8 @@ impl EventLoop {
                     match io_handle {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
-                        IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
-                        IOHandle::UDPSocket(_) => self.handle_io_udp(event, &mut cb_handles),
+                        IOHandle::TCPStream(_) => self.handle_io_tcps(py, event, &mut cb_handles),
+                        IOHandle::UDPSocket(_) => self.handle_io_udp(py, event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
                 }
@@ -260,22 +260,32 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_io_tcps(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
-        let fd = event.token().0;
-        if event.is_readable() {
-            handles_ready.push_back(Box::new(TCPReadHandle { fd }));
-        } else if event.is_writable() {
-            handles_ready.push_back(Box::new(TCPWriteHandle { fd }));
+    fn handle_io_tcps(&self, py: Python, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
+        if let Some(transport) = self.tcp_transports.pin().get(&event.token().0) {
+            if event.is_readable() {
+                handles_ready.push_back(Box::new(TCPReadHandle {
+                    transport: transport.clone_ref(py),
+                }));
+            } else if event.is_writable() {
+                handles_ready.push_back(Box::new(TCPWriteHandle {
+                    transport: transport.clone_ref(py),
+                }));
+            }
         }
     }
 
     #[inline]
-    fn handle_io_udp(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
-        let fd = event.token().0;
-        if event.is_readable() {
-            handles_ready.push_back(Box::new(UDPReadHandle { fd }));
-        } else if event.is_writable() {
-            handles_ready.push_back(Box::new(UDPWriteHandle { fd }));
+    fn handle_io_udp(&self, py: Python, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
+        if let Some(transport) = self.udp_transports.pin().get(&event.token().0) {
+            if event.is_readable() {
+                handles_ready.push_back(Box::new(UDPReadHandle {
+                    transport: transport.clone_ref(py),
+                }));
+            } else if event.is_writable() {
+                handles_ready.push_back(Box::new(UDPWriteHandle {
+                    transport: transport.clone_ref(py),
+                }));
+            }
         }
     }
 
@@ -415,8 +425,8 @@ impl EventLoop {
     }
 
     #[inline(always)]
-    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Py<TCPTransport> {
-        self.tcp_transports.pin().get(&fd).unwrap().clone_ref(py)
+    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Option<Py<TCPTransport>> {
+        self.tcp_transports.pin().get(&fd).map(|v| v.clone_ref(py))
     }
 
     pub(crate) fn with_tcp_listener_streams<T>(&self, fd: usize, func: T)
@@ -498,11 +508,6 @@ impl EventLoop {
     #[inline]
     pub(crate) fn udp_socket_close(&self, fd: usize) {
         self.udp_transports.pin().remove(&fd);
-    }
-
-    #[inline(always)]
-    pub(crate) fn get_udp_transport(&self, fd: usize, py: Python) -> Py<UDPTransport> {
-        self.udp_transports.pin().get(&fd).unwrap().clone_ref(py)
     }
 
     pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<Py<PyAny>> {
