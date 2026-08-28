@@ -292,6 +292,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
     #: network I/O methods
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
+        if not (flags & socket.AI_CANONNAME):
+            info = _ipaddr_info(host, port, family, type, proto)
+            if info is not None:
+                return [info]
         return await self.run_in_executor(None, socket.getaddrinfo, host, port, family, type, proto, flags)
 
     async def getnameinfo(self, sockaddr, flags=0):
