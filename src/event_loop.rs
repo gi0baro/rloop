@@ -563,7 +563,7 @@ impl EventLoop {
         let handle = Python::attach(|py| {
             Py::new(
                 py,
-                CBHandle::new1(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
+                CBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py))),
             )
         })?;
         {
@@ -978,13 +978,18 @@ impl EventLoop {
     fn _call_later(
         &self,
         py: Python,
-        delay: u64,
+        delay: f64,
         callback: Py<PyAny>,
         args: Py<PyAny>,
-        context: Py<PyAny>,
-    ) -> TimerHandle {
-        let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
-        let handle = Py::new(py, CBHandle::new(callback, args, context)).unwrap();
+        context: Option<Py<PyAny>>,
+    ) -> Py<TimerHandle> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let when = Instant::now().duration_since(self.epoch).as_micros() + (delay * 1_000_000.0).round() as u128;
+        let handle = Py::new(
+            py,
+            TimerHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)), when),
+        )
+        .unwrap();
         let timer = Timer {
             handle: Box::new(handle.clone_ref(py)),
             when,
@@ -994,7 +999,7 @@ impl EventLoop {
             guard.push(timer);
         }
 
-        TimerHandle::new(handle, when)
+        handle
     }
 
     #[pyo3(signature = (fd, callback, *args, context=None))]

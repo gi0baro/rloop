@@ -172,16 +172,22 @@ impl Handle for Py<CBHandleOneArg> {
 
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TimerHandle {
-    pub handle: Py<CBHandle>,
+    callback: Py<PyAny>,
+    args: Py<PyAny>,
+    context: Py<PyAny>,
+    cancelled: atomic::AtomicBool,
     #[pyo3(get)]
     when: f64,
 }
 
 impl TimerHandle {
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn new(handle: Py<CBHandle>, when: u128) -> Self {
+    pub(crate) fn new(callback: Py<PyAny>, args: Py<PyAny>, context: Py<PyAny>, when: u128) -> Self {
         Self {
-            handle,
+            callback,
+            args,
+            context,
+            cancelled: false.into(),
             when: (when as f64) / 1_000_000.0,
         }
     }
@@ -190,11 +196,31 @@ impl TimerHandle {
 #[pymethods]
 impl TimerHandle {
     fn cancel(&self) {
-        self.handle.get().cancel();
+        self.cancelled.store(true, atomic::Ordering::Relaxed);
     }
 
     fn cancelled(&self) -> bool {
-        self.handle.cancelled()
+        self.cancelled.load(atomic::Ordering::Relaxed)
+    }
+}
+
+impl Handle for Py<TimerHandle> {
+    cbhandle_cancelled_impl!();
+
+    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let rself = self.get();
+        let ctx = rself.context.as_ptr();
+        let cb = rself.callback.as_ptr();
+        let args = rself.args.as_ptr();
+
+        if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
+            let err_ctx = LogExc::cb_handle(
+                err,
+                format!("Exception in callback {:?}", rself.callback.bind(py)),
+                self.clone_ref(py).into_py_any(py).unwrap(),
+            );
+            _ = event_loop.log_exception(py, err_ctx);
+        }
     }
 }
 
