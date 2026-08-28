@@ -393,6 +393,14 @@ impl TCPTransport {
 
 #[pymethods]
 impl TCPTransport {
+    fn __traverse__(&self, visit: pyo3::gc::PyVisit<'_>) -> Result<(), pyo3::gc::PyTraverseError> {
+        visit.call(&self.proto)?;
+        visit.call(&self.protom_buf_get)?;
+        visit.call(&self.protom_conn_lost)?;
+        visit.call(&self.protom_recv_data)?;
+        Ok(())
+    }
+
     #[pyo3(signature = (name, default = None))]
     fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
         match name {

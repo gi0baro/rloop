@@ -260,6 +260,14 @@ impl UDPTransport {
 
 #[pymethods]
 impl UDPTransport {
+    fn __traverse__(&self, visit: pyo3::gc::PyVisit<'_>) -> Result<(), pyo3::gc::PyTraverseError> {
+        visit.call(&self.proto)?;
+        visit.call(&self.protom_conn_lost)?;
+        visit.call(&self.protom_datagram_received)?;
+        visit.call(&self.protom_error_received)?;
+        Ok(())
+    }
+
     #[pyo3(signature = (name, default = None))]
     fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
         match name {
