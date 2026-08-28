@@ -18,12 +18,13 @@ use crate::{
     handles::Handle,
     log::LogExc,
     sock::SocketWrapper,
+    utils::WriteChunk,
 };
 
 struct UDPTransportState {
     socket: UdpSocket,
     remote_addr: Option<SocketAddr>,
-    write_buf: VecDeque<(Box<[u8]>, SocketAddr)>,
+    write_buf: VecDeque<(WriteChunk, SocketAddr)>,
     write_buf_dsize: usize,
 }
 
@@ -180,24 +181,25 @@ impl UDPTransport {
         _ = self.protom_error_received.call1(py, (exc,));
     }
 
-    fn write(pyself: &Py<Self>, py: Python, data: &[u8], addr: SocketAddr) {
+    fn write(pyself: &Py<Self>, py: Python, data: &[u8], addr: SocketAddr, chunk: impl FnOnce() -> WriteChunk) {
         let rself = pyself.borrow(py);
         let mut state = rself.state.borrow_mut();
 
         let mut conn_err = None;
+        let connected = state.remote_addr.is_some();
         let buf_added = match state.write_buf_dsize {
             0 => {
-                match state.socket.send_to(data, addr) {
-                    Ok(written) if written == data.len() => 0,
-                    Ok(written) => {
-                        state.write_buf.push_back(((&data[written..]).into(), addr));
-                        data.len() - written
-                    }
+                match if connected {
+                    state.socket.send(data)
+                } else {
+                    state.socket.send_to(data, addr)
+                } {
+                    Ok(_) => 0,
                     Err(err)
                         if err.kind() == std::io::ErrorKind::Interrupted
                             || err.kind() == std::io::ErrorKind::WouldBlock =>
                     {
-                        state.write_buf.push_back((data.into(), addr));
+                        state.write_buf.push_back((chunk(), addr));
                         data.len()
                     }
                     Err(err) => {
@@ -218,7 +220,7 @@ impl UDPTransport {
                 }
             }
             _ => {
-                state.write_buf.push_back((data.into(), addr));
+                state.write_buf.push_back((chunk(), addr));
                 data.len()
             }
         };
@@ -390,7 +392,8 @@ impl UDPTransport {
         )
     }
 
-    fn sendto(pyself: Py<Self>, py: Python, data: Cow<[u8]>, addr: Option<(String, u16)>) -> PyResult<()> {
+    #[pyo3(signature = (data, addr = None))]
+    fn sendto(pyself: Py<Self>, py: Python, data: &Bound<PyAny>, addr: Option<(String, u16)>) -> PyResult<()> {
         let rself = pyself.borrow(py);
 
         if rself.closing.load(atomic::Ordering::Relaxed) {
@@ -398,20 +401,28 @@ impl UDPTransport {
                 "Cannot send on closing transport",
             ));
         }
-        if data.is_empty() {
-            return Ok(());
-        }
 
-        match addr
+        let Some(addr) = addr
             .map(|v| SocketAddr::new(IpAddr::from_str(&v.0).unwrap(), v.1))
             .or_else(|| rself.state.borrow().remote_addr)
-        {
-            Some(addr) => {
-                Self::write(&pyself, py, &data, addr);
-                Ok(())
+        else {
+            return Err(pyo3::exceptions::PyValueError::new_err("No remote address specified"));
+        };
+
+        if let Ok(pybytes) = data.cast::<PyBytes>() {
+            let bytes = pybytes.as_bytes();
+            if bytes.is_empty() {
+                return Ok(());
             }
-            None => Err(pyo3::exceptions::PyValueError::new_err("No remote address specified")),
+            Self::write(&pyself, py, bytes, addr, || WriteChunk::py(pybytes, 0));
+            return Ok(());
         }
+        let bytes = data.extract::<Cow<[u8]>>()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Self::write(&pyself, py, &bytes, addr, || WriteChunk::owned((&bytes[..]).into()));
+        Ok(())
     }
 }
 
@@ -465,19 +476,19 @@ impl UDPWriteHandle {
         let mut ret = 0;
         let mut state = transport.state.borrow_mut();
 
-        while let Some((data, addr)) = state.write_buf.pop_front() {
-            match state.socket.send_to(&data, addr) {
-                Ok(written) if written < data.len() => {
-                    state.write_buf.push_front(((&data[written..]).into(), addr));
-                    ret += written;
-                    break;
-                }
+        let connected = state.remote_addr.is_some();
+        while let Some((chunk, addr)) = state.write_buf.pop_front() {
+            match if connected {
+                state.socket.send(chunk.as_slice())
+            } else {
+                state.socket.send_to(chunk.as_slice(), addr)
+            } {
                 Ok(written) => ret += written,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    state.write_buf.push_front((data, addr));
+                    state.write_buf.push_front((chunk, addr));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    state.write_buf.push_front((data, addr));
+                    state.write_buf.push_front((chunk, addr));
                     break;
                 }
                 _ => {

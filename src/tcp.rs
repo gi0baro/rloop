@@ -21,7 +21,7 @@ use crate::{
     log::LogExc,
     py::{asyncio_proto_buf, copy_context},
     sock::SocketWrapper,
-    utils::syscall,
+    utils::{WriteChunk, syscall},
 };
 
 // PyO3 removed private CPython's APIs
@@ -140,55 +140,60 @@ impl TCPServerRef {
     }
 }
 
-enum WriteChunkData {
-    Py { _obj: Py<PyBytes> },
-    Owned { _data: Box<[u8]> },
-}
+// enum WriteChunkData {
+//     Py { _obj: Py<PyBytes> },
+//     Owned { _data: Box<[u8]> },
+// }
 
-struct WriteChunk {
-    _data: WriteChunkData,
-    ptr: *const u8,
-    len: usize,
-    off: usize,
-}
+// pub(crate) struct WriteChunk {
+//     _data: WriteChunkData,
+//     ptr: *const u8,
+//     len: usize,
+//     off: usize,
+// }
 
-impl WriteChunk {
-    #[inline]
-    fn py(obj: &Bound<PyBytes>, off: usize) -> Self {
-        let bytes = obj.as_bytes();
-        Self {
-            ptr: bytes.as_ptr(),
-            len: bytes.len(),
-            off,
-            _data: WriteChunkData::Py {
-                _obj: obj.clone().unbind(),
-            },
-        }
-    }
+// impl WriteChunk {
+//     #[inline]
+//     pub(crate) fn py(obj: &Bound<PyBytes>, off: usize) -> Self {
+//         let bytes = obj.as_bytes();
+//         Self {
+//             ptr: bytes.as_ptr(),
+//             len: bytes.len(),
+//             off,
+//             _data: WriteChunkData::Py {
+//                 _obj: obj.clone().unbind(),
+//             },
+//         }
+//     }
 
-    #[inline]
-    fn owned(data: Box<[u8]>) -> Self {
-        Self {
-            ptr: data.as_ptr(),
-            len: data.len(),
-            off: 0,
-            _data: WriteChunkData::Owned { _data: data },
-        }
-    }
+//     #[inline]
+//     pub(crate) fn owned(data: Box<[u8]>) -> Self {
+//         Self {
+//             ptr: data.as_ptr(),
+//             len: data.len(),
+//             off: 0,
+//             _data: WriteChunkData::Owned { _data: data },
+//         }
+//     }
 
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.len - self.off
-    }
+//     #[inline]
+//     fn remaining(&self) -> usize {
+//         self.len - self.off
+//     }
 
-    #[inline]
-    fn as_iovec(&self) -> libc::iovec {
-        libc::iovec {
-            iov_base: unsafe { self.ptr.add(self.off) }.cast_mut().cast(),
-            iov_len: self.len - self.off,
-        }
-    }
-}
+//     #[inline]
+//     pub(crate) fn as_slice(&self) -> &[u8] {
+//         unsafe { std::slice::from_raw_parts(self.ptr.add(self.off), self.len - self.off) }
+//     }
+
+//     #[inline]
+//     fn as_iovec(&self) -> libc::iovec {
+//         libc::iovec {
+//             iov_base: unsafe { self.ptr.add(self.off) }.cast_mut().cast(),
+//             iov_len: self.len - self.off,
+//         }
+//     }
+// }
 
 struct TCPTransportState {
     stream: TcpStream,

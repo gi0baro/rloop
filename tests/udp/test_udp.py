@@ -36,6 +36,20 @@ class DatagramProto(asyncio.DatagramProtocol):
             self.done.set_result(None)
 
 
+class DatagramRecvProto(DatagramProto):
+    def __init__(self, expected, loop):
+        super().__init__(create_future=True, loop=loop)
+        self.data = []
+        self.expected = expected
+        self.received = loop.create_future()
+
+    def datagram_received(self, data, addr):
+        super().datagram_received(data, addr)
+        self.data.append(data)
+        if len(self.data) == self.expected and not self.received.done():
+            self.received.set_result(None)
+
+
 def test_create_datagram_endpoint_sock(loop):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('127.0.0.1', 0))
@@ -77,3 +91,33 @@ def test_create_datagram_endpoint_remote_addr(loop):
     transport.close()
     loop.run_until_complete(protocol.done)
     assert protocol.state == 'CLOSED'
+
+
+def test_sendto(loop):
+    payloads = [b'connected-bytes', b'connected-owned', b'unconnected']
+
+    async def main():
+        recv_proto = DatagramRecvProto(expected=len(payloads), loop=loop)
+        t_recv, _ = await loop.create_datagram_endpoint(lambda: recv_proto, local_addr=('127.0.0.1', 0))
+        port = t_recv.get_extra_info('sockname')[1]
+        t_conn, conn_proto = await loop.create_datagram_endpoint(
+            lambda: DatagramProto(create_future=True, loop=loop), remote_addr=('127.0.0.1', port)
+        )
+        t_free, free_proto = await loop.create_datagram_endpoint(
+            lambda: DatagramProto(create_future=True, loop=loop), local_addr=('127.0.0.1', 0)
+        )
+
+        t_conn.sendto(payloads[0])
+        t_conn.sendto(bytearray(payloads[1]))
+        t_free.sendto(payloads[2], ('127.0.0.1', port))
+
+        await recv_proto.received
+
+        for transport, proto in ((t_conn, conn_proto), (t_free, free_proto), (t_recv, recv_proto)):
+            transport.close()
+            await proto.done
+        return recv_proto
+
+    proto = loop.run_until_complete(main())
+    assert sorted(proto.data) == sorted(payloads)
+    assert proto.state == 'CLOSED'
