@@ -579,6 +579,7 @@ impl TCPReadHandle {
     fn recv_direct(&self, py: Python, transport: &TCPTransport) -> (Option<Py<PyAny>>, bool, bool) {
         const BUF_MAXSIZE: usize = 262_144;
         //: alloc an uninitialized `PyBytes` and read into it: single copy (kernel -> bytes), matching asyncio/CPython's `sock.recv`
+        #[allow(clippy::cast_possible_wrap)]
         let mut obj =
             unsafe { pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), BUF_MAXSIZE as pyo3::ffi::Py_ssize_t) };
         if obj.is_null() {
@@ -589,7 +590,8 @@ impl TCPReadHandle {
 
         let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, buf);
         if read > 0 {
-            if read < BUF_MAXSIZE && unsafe { _PyBytes_Resize(&mut obj, read as pyo3::ffi::Py_ssize_t) } != 0 {
+            #[allow(clippy::cast_possible_wrap)]
+            if read < BUF_MAXSIZE && unsafe { _PyBytes_Resize(&raw mut obj, read as pyo3::ffi::Py_ssize_t) } != 0 {
                 unsafe { pyo3::ffi::PyErr_Clear() };
                 return (None, closed, false);
             }

@@ -17,6 +17,7 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
     server::Server,
+    sock::PseudoSocket,
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
     udp::{UDPReadHandle, UDPTransport, UDPWriteHandle},
@@ -1194,16 +1195,21 @@ impl EventLoop {
     fn _tcp_server(
         pyself: Py<Self>,
         py: Python,
-        socks: Py<PyAny>,
-        rsocks: Vec<(i32, i32)>,
+        rsocks: Vec<(i32, i32, i32, i32)>,
         protocol_factory: Py<PyAny>,
         backlog: i32,
     ) -> PyResult<Py<Server>> {
-        let mut servers = Vec::new();
-        for (fd, family) in rsocks {
+        let closed = Arc::new(atomic::AtomicBool::new(false));
+        let mut servers = Vec::with_capacity(rsocks.len());
+        let mut psocks = Vec::with_capacity(rsocks.len());
+        for (fd, family, stype, proto) in rsocks {
             servers.push(TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py)));
+            psocks.push(Py::new(
+                py,
+                PseudoSocket::new(fd, family, stype, proto, closed.clone()),
+            )?);
         }
-        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        let server = Server::tcp(pyself.clone_ref(py), psocks, servers, closed);
         Py::new(py, server)
     }
 

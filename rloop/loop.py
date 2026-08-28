@@ -157,7 +157,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         results = await _gather(*[ag.aclose() for ag in closing_agens], return_exceptions=True)
 
-        for result, agen in zip(results, closing_agens):
+        for result, agen in zip(results, closing_agens, strict=False):
             if isinstance(result, Exception):
                 self.call_exception_handler(
                     {
@@ -577,14 +577,14 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         rsocks = []
         for sock in sockets:
             sock.setblocking(False)
-            rsocks.append((sock.fileno(), sock.family))
+            rsocks.append((sock.fileno(), sock.family, sock.type, sock.proto))
             sock.detach()
 
         # TODO: ssl
-        # server = self._tcp_server(sockets, rsocks, protocol_factory, backlog,
+        # server = self._tcp_server(rsocks, protocol_factory, backlog,
         #                 ssl, ssl_handshake_timeout,
         #                 ssl_shutdown_timeout)
-        server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
+        server = Server(self._tcp_server(rsocks, protocol_factory, backlog))
 
         if start_serving:
             await server.start_serving()

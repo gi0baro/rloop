@@ -1,7 +1,8 @@
 use pyo3::prelude::*;
-use std::sync::atomic;
+use std::sync::{Arc, atomic};
 
 use crate::event_loop::EventLoop;
+use crate::sock::PseudoSocket;
 use crate::tcp::TCPServer;
 
 enum ServerType {
@@ -14,22 +15,26 @@ enum ServerType {
 pub(crate) struct Server {
     #[pyo3(get)]
     _loop: Py<EventLoop>,
-    #[pyo3(get)]
-    _sockets: Py<PyAny>,
-    closed: atomic::AtomicBool,
+    _sockets: Vec<Py<PseudoSocket>>,
+    closed: Arc<atomic::AtomicBool>,
     serving: atomic::AtomicBool,
     servers: Vec<ServerType>,
     // serve_forever_fut: RwLock<Option<Py<PyAny>>>,
 }
 
 impl Server {
-    pub(crate) fn tcp(event_loop: Py<EventLoop>, sockets: Py<PyAny>, servers: Vec<TCPServer>) -> Self {
+    pub(crate) fn tcp(
+        event_loop: Py<EventLoop>,
+        sockets: Vec<Py<PseudoSocket>>,
+        servers: Vec<TCPServer>,
+        closed: Arc<atomic::AtomicBool>,
+    ) -> Self {
         let srv: Vec<ServerType> = servers.into_iter().map(ServerType::TCP).collect();
 
         Self {
             _loop: event_loop,
             _sockets: sockets,
-            closed: false.into(),
+            closed,
             serving: false.into(),
             servers: srv,
             // serve_forever_fut: RwLock::new(None),
@@ -57,6 +62,14 @@ impl Server {
     //     let mut guard = self.serve_forever_fut.write().unwrap();
     //     *guard = Some(val);
     // }
+
+    #[getter(_sockets)]
+    fn get_sockets(&self, py: Python) -> Vec<Py<PseudoSocket>> {
+        if self.closed.load(atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        self._sockets.iter().map(|s| s.clone_ref(py)).collect()
+    }
 
     fn _start_serving(&self, py: Python) -> PyResult<()> {
         for server in &self.servers {
