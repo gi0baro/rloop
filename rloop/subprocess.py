@@ -29,7 +29,7 @@ class _PidfdChildWatcher(_ChildWatcher):
         self._loop.add_reader(pidfd, self._do_wait, pid, pidfd, callback, args)
 
     def _do_wait(self, pid, pidfd, callback, args):
-        self._loop._remove_reader(pidfd)
+        self._loop.remove_reader(pidfd)
         try:
             _, status = os.waitpid(pid, 0)
         except ChildProcessError:
