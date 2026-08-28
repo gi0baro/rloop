@@ -107,7 +107,11 @@ macro_rules! cb_handle_match_args {
                 (h.clone_ref($py).into_any(), Box::new(h) as BoxedHandle)
             }
             _ => {
-                let h = Py::new($py, CBHandle::new($callback, $args.clone().unbind().into_any(), $context)).unwrap();
+                let h = Py::new(
+                    $py,
+                    CBHandle::new($callback, $args.clone().unbind().into_any(), $context),
+                )
+                .unwrap();
                 (h.clone_ref($py).into_any(), Box::new(h) as BoxedHandle)
             }
         };
