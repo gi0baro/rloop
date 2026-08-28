@@ -46,6 +46,7 @@ pub struct EventLoopRunState {
     buf: Box<[u8]>,
     events: event::Events,
     pub read_buf: Box<[u8]>,
+    pub iovecs: Vec<libc::iovec>,
     ready: VecDeque<BoxedHandle>,
     tick_last: u128,
 }
@@ -1252,6 +1253,7 @@ impl EventLoop {
             buf: vec![0; 4096].into_boxed_slice(),
             events: event::Events::with_capacity(128),
             read_buf: vec![0; 262_144].into_boxed_slice(),
+            iovecs: Vec::with_capacity(64),
             ready: VecDeque::with_capacity(128),
             tick_last: 0,
         };

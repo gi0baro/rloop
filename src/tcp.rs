@@ -135,9 +135,60 @@ impl TCPServerRef {
         (pytransport, Box::new(conn_handle))
     }
 }
+
+enum WriteChunkData {
+    Py { _obj: Py<PyBytes> },
+    Owned { _data: Box<[u8]> },
+}
+
+struct WriteChunk {
+    _data: WriteChunkData,
+    ptr: *const u8,
+    len: usize,
+    off: usize,
+}
+
+impl WriteChunk {
+    #[inline]
+    fn py(obj: &Bound<PyBytes>, off: usize) -> Self {
+        let bytes = obj.as_bytes();
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+            off,
+            _data: WriteChunkData::Py {
+                _obj: obj.clone().unbind(),
+            },
+        }
+    }
+
+    #[inline]
+    fn owned(data: Box<[u8]>) -> Self {
+        Self {
+            ptr: data.as_ptr(),
+            len: data.len(),
+            off: 0,
+            _data: WriteChunkData::Owned { _data: data },
+        }
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.len - self.off
+    }
+
+    #[inline]
+    fn as_iovec(&self) -> libc::iovec {
+        libc::iovec {
+            iov_base: unsafe { self.ptr.add(self.off) }.cast_mut().cast(),
+            iov_len: self.len - self.off,
+        }
+    }
+}
+
 struct TCPTransportState {
     stream: TcpStream,
-    write_buf: VecDeque<Box<[u8]>>,
+    write_buf: VecDeque<WriteChunk>,
     write_buf_dsize: usize,
 }
 
@@ -298,7 +349,7 @@ impl TCPTransport {
         self.pyloop.get().tcp_stream_close(py, self.fd);
     }
 
-    fn try_write(pyself: &Py<Self>, py: Python, data: &[u8]) -> PyResult<()> {
+    fn try_write(pyself: &Py<Self>, py: Python, data: &[u8], chunk: impl FnOnce(usize) -> WriteChunk) -> PyResult<()> {
         let rself = pyself.borrow(py);
 
         if rself.weof.load(atomic::Ordering::Relaxed) {
@@ -315,14 +366,14 @@ impl TCPTransport {
                 Ok(written) if written as usize == data.len() => 0,
                 Ok(written) => {
                     let written = written as usize;
-                    state.write_buf.push_back((&data[written..]).into());
+                    state.write_buf.push_back(chunk(written));
                     data.len() - written
                 }
                 Err(err)
                     if err.kind() == std::io::ErrorKind::Interrupted
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    state.write_buf.push_back(data.into());
+                    state.write_buf.push_back(chunk(0));
                     data.len()
                 }
                 Err(err) => {
@@ -342,7 +393,7 @@ impl TCPTransport {
                 }
             },
             _ => {
-                state.write_buf.push_back(data.into());
+                state.write_buf.push_back(chunk(0));
                 data.len()
             }
         };
@@ -522,15 +573,18 @@ impl TCPTransport {
         )
     }
 
-    fn write(pyself: Py<Self>, py: Python, data: Cow<[u8]>) -> PyResult<()> {
-        Self::try_write(&pyself, py, &data)
+    fn write(pyself: Py<Self>, py: Python, data: &Bound<PyAny>) -> PyResult<()> {
+        if let Ok(pybytes) = data.cast::<PyBytes>() {
+            return Self::try_write(&pyself, py, pybytes.as_bytes(), |off| WriteChunk::py(pybytes, off));
+        }
+        let bytes = data.extract::<Cow<[u8]>>()?;
+        Self::try_write(&pyself, py, &bytes, |off| WriteChunk::owned((&bytes[off..]).into()))
     }
 
     fn writelines(pyself: Py<Self>, py: Python, data: &Bound<PyAny>) -> PyResult<()> {
         let pybytes = PyBytes::new(py, &[0; 0]);
         let pybytesj = pybytes.call_method1(pyo3::intern!(py, "join"), (data,))?;
-        let bytes = pybytesj.extract::<Cow<[u8]>>()?;
-        Self::try_write(&pyself, py, &bytes)
+        Self::write(pyself, py, &pybytesj)
     }
 
     fn write_eof(&self) {
@@ -704,27 +758,47 @@ pub(crate) struct TCPWriteHandle {
 
 impl TCPWriteHandle {
     #[inline]
-    fn write(&self, transport: &TCPTransport) -> Option<usize> {
+    fn write(&self, transport: &TCPTransport, iovecs: &mut Vec<libc::iovec>) -> Option<usize> {
+        const MAX_IOV: usize = 1024;
+
         #[allow(clippy::cast_possible_wrap)]
         let fd = self.fd as i32;
         let mut ret = 0;
         let mut state = transport.state.borrow_mut();
-        while let Some(data) = state.write_buf.pop_front() {
-            match syscall!(write(fd, data.as_ptr().cast(), data.len())) {
-                Ok(written) if (written as usize) < data.len() => {
+        while !state.write_buf.is_empty() {
+            iovecs.clear();
+            let mut requested = 0;
+            for chunk in state.write_buf.iter().take(MAX_IOV) {
+                requested += chunk.remaining();
+                iovecs.push(chunk.as_iovec());
+            }
+
+            #[allow(clippy::cast_possible_wrap)]
+            match syscall!(writev(fd, iovecs.as_ptr(), iovecs.len() as i32)) {
+                Ok(written) => {
                     let written = written as usize;
-                    state.write_buf.push_front((&data[written..]).into());
                     ret += written;
-                    break;
+                    let mut consumed = written;
+                    let mut drained = 0;
+                    for iov in iovecs.iter() {
+                        if consumed < iov.iov_len {
+                            break;
+                        }
+                        consumed -= iov.iov_len;
+                        drained += 1;
+                    }
+                    if drained > 0 {
+                        state.write_buf.drain(..drained);
+                    }
+                    if consumed > 0 {
+                        state.write_buf.front_mut().unwrap().off += consumed;
+                    }
+                    if written < requested {
+                        break;
+                    }
                 }
-                Ok(written) => ret += written as usize,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    state.write_buf.push_front(data);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    state.write_buf.push_front(data);
-                    break;
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 _ => {
                     state.write_buf.clear();
                     state.write_buf_dsize = 0;
@@ -738,12 +812,12 @@ impl TCPWriteHandle {
 }
 
 impl Handle for TCPWriteHandle {
-    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+    fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
         let pytransport = event_loop.get_tcp_transport(self.fd, py);
         let transport = pytransport.borrow(py);
         let stream_close;
 
-        if let Some(written) = self.write(&transport) {
+        if let Some(written) = self.write(&transport, &mut state.iovecs) {
             if written > 0 {
                 TCPTransport::write_buf_size_decr(&pytransport, py);
             }
