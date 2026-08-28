@@ -1019,11 +1019,11 @@ impl EventLoop {
                     #[allow(clippy::cast_possible_wrap)]
                     let mut source = Source::FD(fd as i32);
                     let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().reregister(&mut source, token, data.interest);
+                    _ = guard_poll.registry().reregister(&mut source, token, interest);
                     return IOHandle::Py(PyHandleData {
                         interest,
                         cbr: Some(handle.clone_ref(py)),
-                        cbw: Some(data.cbw.as_ref().unwrap().clone_ref(py)),
+                        cbw: data.cbw.as_ref().map(|v| v.clone_ref(py)),
                     });
                 }
                 unreachable!()
@@ -1109,10 +1109,10 @@ impl EventLoop {
                     #[allow(clippy::cast_possible_wrap)]
                     let mut source = Source::FD(fd as i32);
                     let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().reregister(&mut source, token, data.interest);
+                    _ = guard_poll.registry().reregister(&mut source, token, interest);
                     return IOHandle::Py(PyHandleData {
                         interest,
-                        cbr: Some(data.cbr.as_ref().unwrap().clone_ref(py)),
+                        cbr: data.cbr.as_ref().map(|v| v.clone_ref(py)),
                         cbw: Some(handle.clone_ref(py)),
                     });
                 }
