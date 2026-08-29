@@ -88,6 +88,11 @@ def run(args):
 
         loop = uvloop.new_event_loop()
         print('using UVLoop')
+    elif args.loop == 'zuvloop':
+        import zuvloop
+
+        loop = zuvloop.new_event_loop()
+        print('using ZUVLoop')
     else:
         loop = asyncio.new_event_loop()
         print('using asyncio loop')

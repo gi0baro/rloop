@@ -16,7 +16,7 @@ The only test performed is the raw socket one.
 
 | Python version | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-{{ for pykey in ["310", "311", "312", "313"]: }}
+{{ for pykey in ["310", "311", "312", "313", "314"]: }}
 {{ _data = globals().get(f"data{pykey}") }}
 {{ if not _data: }}
 {{ continue }}
@@ -24,19 +24,4 @@ The only test performed is the raw socket one.
 | {{ =_data.pyver }} | {{ =bdata["messages"] }} | {{ =bdata["rps"] }} | {{ =f"{bdata['latency_mean']}ms" }} | {{ =f"{bdata['latency_percentiles'][-2][1]}ms" }} | {{ =bdata["latency_std"] }} |
 {{ pass }}
 
-{{ pass }}
-
-### 10KB VS other
-
-| Python version | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
-| --- | --- | --- | --- | --- | --- | --- |
-{{ for pykey in ["310", "311", "312", "313"]: }}
-{{ _data = globals().get(f"data{pykey}") }}
-{{ if not _data: }}
-{{ continue }}
-{{ dcmp = _data.results["raw"]["rloop"]["1"]["10240"]["rps"] }}
-{{ for lkey, bdata in _data.results["raw"].items(): }}
-{{ lbdata = bdata["1"]["10240"] }}
-| {{ =_data.pyver }} | {{ =lkey }} | {{ =lbdata["messages"] }} | {{ =lbdata["rps"] }} ({{ =round(lbdata["rps"] / dcmp * 100, 1) }}%) | {{ =f"{lbdata['latency_mean']}ms" }} | {{ =f"{lbdata['latency_percentiles'][-2][1]}ms" }} | {{ =lbdata["latency_std"] }} |
-{{ pass }}
 {{ pass }}

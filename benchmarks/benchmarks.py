@@ -12,9 +12,15 @@ from pathlib import Path
 
 WD = Path(__file__).resolve().parent
 CPU = multiprocessing.cpu_count()
-LOOPS = ['asyncio', 'rloop', 'uvloop']
+LOOPS = ['asyncio', 'rloop', 'uvloop', 'zuvloop']
 MSGS = [1024, 1024 * 10, 1024 * 100]
 CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
+
+
+def get_loops():
+    if internal := os.environ.get('BENCHMARK_SELF_ONLY'):
+        return ['rloop']
+    return LOOPS
 
 
 @contextmanager
@@ -87,7 +93,7 @@ def benchmark(msgs=None, concurrencies=None):
 
 def raw():
     results = {}
-    for loop in LOOPS:
+    for loop in get_loops():
         with server(loop):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
@@ -95,7 +101,7 @@ def raw():
 
 def stream():
     results = {}
-    for loop in LOOPS:
+    for loop in get_loops():
         with server(loop, streams=True):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
@@ -103,7 +109,7 @@ def stream():
 
 def proto():
     results = {}
-    for loop in LOOPS:
+    for loop in get_loops():
         with server(loop, proto=True):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
@@ -111,7 +117,7 @@ def proto():
 
 def concurrency():
     results = {}
-    for loop in LOOPS:
+    for loop in get_loops():
         with server(loop):
             results[loop] = benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
     return results
@@ -128,9 +134,13 @@ def run():
         'raw': raw,
         'stream': stream,
         'proto': proto,
-        'concurrency': concurrency,
+        # 'concurrency': concurrency,
     }
     inp_benchmarks = sys.argv[1:] or ['raw']
+    if 'all' in inp_benchmarks:
+        inp_benchmarks.remove('all')
+        inp_benchmarks.extend(list(all_benchmarks.keys()))
+
     run_benchmarks = set(inp_benchmarks) & set(all_benchmarks.keys())
 
     now = datetime.datetime.utcnow()
