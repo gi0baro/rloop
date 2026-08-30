@@ -108,3 +108,80 @@ def test_socket_recv_cancel(loop):
 
     data = loop.run_until_complete(server())
     assert data == b'x'
+
+
+def test_add_reader_level_triggered(loop):
+    r, w = socket.socketpair()
+    r.setblocking(False)
+    received = bytearray()
+
+    async def main():
+        done = loop.create_future()
+
+        def on_readable():
+            received.extend(r.recv(1))
+            if len(received) == 10:
+                loop.remove_reader(r.fileno())
+                done.set_result(None)
+
+        loop.add_reader(r.fileno(), on_readable)
+        w.send(b'x' * 10)
+        await asyncio.wait_for(done, timeout=5)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        r.close()
+        w.close()
+    assert bytes(received) == b'x' * 10
+
+
+def test_add_writer_level_triggered(loop):
+    r, w = socket.socketpair()
+    w.setblocking(False)
+    state = {'count': 0}
+
+    async def main():
+        done = loop.create_future()
+
+        def on_writable():
+            state['count'] += 1
+            if state['count'] == 3:
+                loop.remove_writer(w.fileno())
+                done.set_result(None)
+
+        loop.add_writer(w.fileno(), on_writable)
+        await asyncio.wait_for(done, timeout=5)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        r.close()
+        w.close()
+    assert state['count'] == 3
+
+
+def test_socket_op_fd_recycle(loop):
+    async def parked_recv(sock, peer, payload):
+        task = loop.create_task(loop.sock_recv(sock, 1024))
+        loop.call_later(0.05, peer.send, payload)
+        return await asyncio.wait_for(task, timeout=5)
+
+    async def main():
+        a1, b1 = socket.socketpair()
+        a1.setblocking(False)
+        try:
+            assert await parked_recv(a1, b1, b'x') == b'x'
+        finally:
+            a1.close()
+            b1.close()
+
+        a2, b2 = socket.socketpair()
+        a2.setblocking(False)
+        try:
+            assert await parked_recv(a2, b2, b'y') == b'y'
+        finally:
+            a2.close()
+            b2.close()
+
+    loop.run_until_complete(main())

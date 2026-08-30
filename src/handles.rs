@@ -1,8 +1,8 @@
 use pyo3::{IntoPyObjectExt, prelude::*};
-use std::sync::atomic;
+use std::sync::{Arc, Mutex, atomic};
 
 use crate::{
-    event_loop::{EventLoop, EventLoopRunState},
+    event_loop::{EventLoop, EventLoopRunState, PyHandleData},
     log::LogExc,
     py::{run_in_ctx, run_in_ctx0},
 };
@@ -196,13 +196,64 @@ impl Handle for Py<CBHandleOneArg> {
     }
 }
 
+//: level-triggered emulation wrapper for `add_reader`/`add_writer` callbacks
+pub(crate) struct CBLTHandle {
+    pub data: Arc<Mutex<PyHandleData>>,
+    pub write: bool,
+}
+
+impl CBLTHandle {
+    fn cb(&self, py: Python) -> Option<Py<CBHandle>> {
+        let guard = self.data.lock().unwrap();
+        let slot = match self.write {
+            true => &guard.cbw,
+            false => &guard.cbr,
+        };
+        match slot {
+            Some(cb) if !Handle::cancelled(cb) => Some(cb.clone_ref(py)),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn fd_ready(fd: i32, write: bool) -> bool {
+        let events = match write {
+            true => libc::POLLOUT,
+            false => libc::POLLIN,
+        };
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        match crate::utils::syscall!(poll(&raw mut pfd, 1, 0)) {
+            Ok(n) if n > 0 => pfd.revents & (events | libc::POLLERR | libc::POLLHUP) != 0,
+            _ => false,
+        }
+    }
+}
+
+impl Handle for CBLTHandle {
+    fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
+        let Some(cb) = self.cb(py) else {
+            return;
+        };
+        cb.run(py, event_loop, state);
+        let fd = self.data.lock().unwrap().fd;
+        if CBLTHandle::fd_ready(fd, self.write) && self.cb(py).is_some() {
+            _ = event_loop.schedule_handle(
+                CBLTHandle {
+                    data: self.data.clone(),
+                    write: self.write,
+                },
+                None,
+            );
+        }
+    }
+}
+
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TimerHandle {
     callback: Py<PyAny>,
     args: Py<PyAny>,
     context: Py<PyAny>,
     cancelled: atomic::AtomicBool,
-    #[pyo3(get)]
     when: f64,
 }
 
@@ -227,6 +278,10 @@ impl TimerHandle {
 
     fn cancelled(&self) -> bool {
         self.cancelled.load(atomic::Ordering::Relaxed)
+    }
+
+    fn when(&self) -> f64 {
+        self.when
     }
 }
 

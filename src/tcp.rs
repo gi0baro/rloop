@@ -2,21 +2,18 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 
 use anyhow::Result;
-use mio::{
-    Interest,
-    net::{TcpListener, TcpStream},
-};
+use mio::net::{TcpListener, TcpStream};
 use pyo3::{IntoPyObjectExt, buffer::PyBuffer, prelude::*, types::PyBytes};
 use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, VecDeque},
     io::Read,
-    sync::atomic,
+    sync::{Arc, OnceLock, Weak, atomic},
 };
 
 use crate::{
-    event_loop::{EventLoop, EventLoopRunState},
+    event_loop::{EventLoop, EventLoopRunState, IORegistration},
     handles::{BoxedHandle, CBHandle, Handle},
     log::LogExc,
     py::{asyncio_proto_buf, copy_context},
@@ -150,6 +147,7 @@ struct TCPTransportState {
 pub(crate) struct TCPTransport {
     pub fd: usize,
     pub lfd: Option<usize>,
+    io: OnceLock<Weak<IORegistration>>,
     state: RefCell<TCPTransportState>,
     pyloop: Py<EventLoop>,
     // atomics
@@ -212,6 +210,7 @@ impl TCPTransport {
             lfd,
             state: RefCell::new(state),
             pyloop,
+            io: OnceLock::new(),
             closing: false.into(),
             paused: false.into(),
             water_hi: wh.into(),
@@ -248,6 +247,15 @@ impl TCPTransport {
         Ok(rself.proto.clone_ref(py))
     }
 
+    pub(crate) fn io_attach(&self, reg: &Arc<IORegistration>) {
+        _ = self.io.set(Arc::downgrade(reg));
+    }
+
+    #[inline]
+    fn io_reg(&self) -> Option<Arc<IORegistration>> {
+        self.io.get().and_then(Weak::upgrade)
+    }
+
     #[inline]
     fn write_buf_size_decr(pyself: &Py<Self>, py: Python) {
         let rself = pyself.borrow(py);
@@ -262,7 +270,7 @@ impl TCPTransport {
     }
 
     #[inline]
-    fn close_from_read_handle(&self, py: Python, event_loop: &EventLoop) -> bool {
+    fn close_from_read_handle(&self, py: Python) -> bool {
         if self
             .closing
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
@@ -275,7 +283,9 @@ impl TCPTransport {
             return false;
         }
 
-        event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+        if let Some(reg) = self.io_reg() {
+            reg.sched.disarm_w();
+        }
         self.call_conn_lost(py, None);
         true
     }
@@ -339,16 +349,18 @@ impl TCPTransport {
                     data.len()
                 }
                 Err(err) => {
-                    if state.write_buf_dsize > 0 {
-                        // reset buf_dsize?
-                        rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::WRITABLE);
+                    if state.write_buf_dsize > 0
+                        && let Some(reg) = rself.io_reg()
+                    {
+                        reg.sched.disarm_w();
                     }
                     if rself
                         .closing
                         .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
                         .is_ok()
+                        && let Some(reg) = rself.io_reg()
                     {
-                        rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
+                        reg.sched.disarm_r();
                     }
                     conn_err = Some(err);
                     0
@@ -360,8 +372,11 @@ impl TCPTransport {
             }
         };
         if buf_added > 0 {
-            if state.write_buf_dsize == 0 {
-                rself.pyloop.get().tcp_stream_add(rself.fd, Interest::WRITABLE);
+            if state.write_buf_dsize == 0
+                && let Some(reg) = rself.io_reg()
+            {
+                reg.sched.arm_w();
+                reg.sched.clear_ready_w();
             }
             state.write_buf_dsize += buf_added;
             if state.write_buf_dsize > rself.water_hi.load(atomic::Ordering::Relaxed)
@@ -442,11 +457,14 @@ impl TCPTransport {
             return;
         }
 
-        let event_loop = self.pyloop.get();
-        event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+        if let Some(reg) = self.io_reg() {
+            reg.sched.disarm_r();
+        }
         let buf_empty = self.state.borrow().write_buf_dsize == 0;
         if buf_empty {
-            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+            if let Some(reg) = self.io_reg() {
+                reg.sched.disarm_w();
+            }
             self.call_conn_lost(py, None);
         }
     }
@@ -476,21 +494,34 @@ impl TCPTransport {
         {
             return;
         }
-        self.pyloop.get().tcp_stream_rem(self.fd, Interest::READABLE);
+        if let Some(reg) = self.io_reg() {
+            reg.sched.disarm_r();
+        }
     }
 
-    fn resume_reading(&self) {
-        if self.closing.load(atomic::Ordering::Relaxed) {
+    fn resume_reading(pyself: Py<Self>, py: Python) {
+        let rself = pyself.borrow(py);
+        if rself.closing.load(atomic::Ordering::Relaxed) {
             return;
         }
-        if self
+        if rself
             .paused
             .compare_exchange(true, false, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_err()
         {
             return;
         }
-        self.pyloop.get().tcp_stream_add(self.fd, Interest::READABLE);
+        if let Some(reg) = rself.io_reg() {
+            reg.sched.arm_r();
+            if reg.sched.consume_ready_r() {
+                _ = rself.pyloop.get().schedule_handle(
+                    TCPReadHandle {
+                        transport: pyself.clone_ref(py),
+                    },
+                    None,
+                );
+            }
+        }
     }
 
     #[pyo3(signature = (high = None, low = None))]
@@ -577,15 +608,19 @@ impl TCPTransport {
     }
 
     fn abort(&self, py: Python) {
-        if self.state.borrow().write_buf_dsize > 0 {
-            self.pyloop.get().tcp_stream_rem(self.fd, Interest::WRITABLE);
-        }
-        if self
-            .closing
-            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
-            .is_ok()
-        {
-            self.pyloop.get().tcp_stream_rem(self.fd, Interest::READABLE);
+        if let Some(reg) = self.io_reg() {
+            if self.state.borrow().write_buf_dsize > 0 {
+                reg.sched.disarm_w();
+            }
+            if self
+                .closing
+                .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                reg.sched.disarm_r();
+            }
+        } else {
+            self.closing.store(true, atomic::Ordering::Relaxed);
         }
         self.call_conn_lost(py, None);
     }
@@ -674,14 +709,16 @@ impl TCPReadHandle {
     }
 
     #[inline]
-    fn recv_eof(&self, py: Python, event_loop: &EventLoop, transport: &TCPTransport) -> bool {
-        event_loop.tcp_stream_rem(transport.fd, Interest::READABLE);
+    fn recv_eof(&self, py: Python, transport: &TCPTransport) -> bool {
+        if let Some(reg) = transport.io_reg() {
+            reg.sched.disarm_r();
+        }
         if let Ok(pyr) = transport.proto.call_method0(py, pyo3::intern!(py, "eof_received"))
             && let Ok(true) = pyr.is_truthy(py)
         {
             return false;
         }
-        transport.close_from_read_handle(py, event_loop)
+        transport.close_from_read_handle(py)
     }
 }
 
@@ -709,7 +746,7 @@ impl Handle for TCPReadHandle {
             }
 
             if eof {
-                close = self.recv_eof(py, event_loop, &transport);
+                close = self.recv_eof(py, &transport);
             }
 
             break;
@@ -802,8 +839,8 @@ impl Handle for TCPWriteHandle {
         }
 
         let buf_empty = transport.state.borrow().write_buf.is_empty();
-        if buf_empty {
-            event_loop.tcp_stream_rem(transport.fd, Interest::WRITABLE);
+        if buf_empty && let Some(reg) = transport.io_reg() {
+            reg.sched.disarm_w();
         }
 
         match stream_close {

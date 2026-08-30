@@ -840,7 +840,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
         future = _NativeSockReaderFuture(sock, self)
-        self._sock_recv_native(fd, future, nbytes)
+        self._sock_recv_native(fd, sock, future, nbytes)
         return await future
 
     async def sock_recv_into(self, sock, buf):
@@ -852,7 +852,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
         future = _NativeSockReaderFuture(sock, self)
-        self._sock_recv_into_native(fd, future, buf)
+        self._sock_recv_into_native(fd, sock, future, buf)
         return await future
 
     # async def sock_recvfrom(self, sock, bufsize):
@@ -876,7 +876,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
         future = _NativeSockWriterFuture(sock, self)
-        self._sock_sendall_native(fd, future, data, n)
+        self._sock_sendall_native(fd, sock, future, data, n)
         return await future
 
     # async def sock_sendto(self, sock, data, address):

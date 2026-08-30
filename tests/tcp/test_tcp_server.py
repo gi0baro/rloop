@@ -77,4 +77,46 @@ def test_tcp_server_recv_send(loop):
     assert state['data'] == msg
 
 
-# TODO: test buffered proto
+def test_tcp_server_pause_resume_reading(loop):
+    msg = b'a' * _SIZE
+    state = {'data': b''}
+
+    class PausingEchoProtocol(BaseProto):
+        paused_once = False
+
+        def data_received(self, data):
+            super().data_received(data)
+            self.data += data
+            if not self.paused_once:
+                self.paused_once = True
+                self.transport.pause_reading()
+                loop.call_later(0.1, self.transport.resume_reading)
+            if len(self.data) >= _SIZE:
+                self.transport.write(self.data)
+
+    proto = PausingEchoProtocol()
+
+    async def main():
+        sock = socket.socket()
+        sock.setblocking(False)
+
+        with sock:
+            sock.bind(('127.0.0.1', 0))
+            addr = sock.getsockname()
+            srv = await loop.create_server(lambda: proto, sock=sock)
+            fut = loop.run_in_executor(None, client, addr)
+            await fut
+            srv.close()
+
+    def client(addr):
+        sock = socket.socket()
+        sock.settimeout(5)
+        with sock:
+            sock.connect(addr)
+            sock.sendall(msg)
+            while len(state['data']) < _SIZE:
+                state['data'] += sock.recv(1024 * 16)
+
+    loop.run_until_complete(main())
+    assert proto.paused_once
+    assert state['data'] == msg

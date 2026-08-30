@@ -12,8 +12,8 @@ use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
 use crate::{
-    handles::{BoxedHandle, CBHandle, Handle, TimerHandle, cb_handle_match_args},
-    io::Source,
+    handles::{BoxedHandle, CBHandle, CBLTHandle, Handle, TimerHandle, cb_handle_match_args},
+    io::{ScheduledIO, Source, TOKEN_SIGNALS, TOKEN_WAKER},
     log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
     server::Server,
@@ -25,18 +25,28 @@ use crate::{
 };
 
 enum IOHandle {
-    Py(PyHandleData),
+    Py(Arc<Mutex<PyHandleData>>),
     PySock(Arc<Mutex<PySockHandleData>>),
-    Signals,
     TCPListener(TCPListenerHandleData),
-    TCPStream(Interest),
-    UDPSocket(Interest),
+    TCPStream(Py<TCPTransport>),
+    UDPSocket(Py<UDPTransport>),
 }
 
-struct PyHandleData {
+//: We use a single poller registration strategy.
+//  The pointer-token and deferred-release scheme is adapted from TonIO
+//
+//  source: https://github.com/gi0baro/tonio, `src/runtime.rs`
+//  copyright: Giovanni Barillari
+pub(crate) struct IORegistration {
+    pub(crate) sched: ScheduledIO,
+    handle: IOHandle,
+}
+
+pub(crate) struct PyHandleData {
+    pub fd: i32,
     interest: Interest,
-    cbr: Option<Py<CBHandle>>,
-    cbw: Option<Py<CBHandle>>,
+    pub cbr: Option<Py<CBHandle>>,
+    pub cbw: Option<Py<CBHandle>>,
 }
 
 struct TCPListenerHandleData {
@@ -58,7 +68,9 @@ pub struct EventLoop {
     idle: atomic::AtomicBool,
     io: Mutex<Poll>,
     waker: Arc<Waker>,
-    handles_io: papaya::HashMap<Token, IOHandle>,
+    handles_fd: papaya::HashMap<usize, Arc<IORegistration>>,
+    io_pending_release: Mutex<Vec<Arc<IORegistration>>>,
+    io_needs_release: atomic::AtomicBool,
     handles_ready: Mutex<VecDeque<BoxedHandle>>,
     handles_sched: Mutex<BinaryHeap<Timer>>,
     epoch: Instant,
@@ -92,6 +104,10 @@ pub struct EventLoop {
 impl EventLoop {
     #[inline]
     fn step(&self, py: Python, state: &mut EventLoopRunState) -> std::result::Result<(), std::io::Error> {
+        if self.io_needs_release.swap(false, atomic::Ordering::Acquire) {
+            self.io_pending_release.lock().unwrap().clear();
+        }
+
         let mut sched_time: Option<u64> = None;
         let mut skip_poll = false;
 
@@ -155,17 +171,24 @@ impl EventLoop {
             .fetch_sub(cb_handles.len(), atomic::Ordering::Release);
 
         if !skip_poll {
-            let io_handles = self.handles_io.pin();
             for event in &state.events {
                 // NOTE: cancellation is not necessary as we have custom futures
-                if let Some(io_handle) = io_handles.get(&event.token()) {
-                    match io_handle {
-                        IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
-                        IOHandle::PySock(handle) => Self::handle_io_pysock(event, handle, &mut cb_handles),
-                        IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
-                        IOHandle::TCPStream(_) => self.handle_io_tcps(py, event, &mut cb_handles),
-                        IOHandle::UDPSocket(_) => self.handle_io_udp(py, event, &mut cb_handles),
-                        IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
+                match event.token().0 {
+                    TOKEN_WAKER => {}
+                    TOKEN_SIGNALS => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
+                    token => {
+                        let reg = unsafe { &*std::ptr::with_exposed_provenance::<IORegistration>(token) };
+                        match &reg.handle {
+                            IOHandle::Py(handle) => Self::handle_io_py(event, handle, &mut cb_handles),
+                            IOHandle::PySock(handle) => Self::handle_io_pysock(event, handle, &mut cb_handles),
+                            IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &mut cb_handles),
+                            IOHandle::TCPStream(transport) => {
+                                Self::handle_io_tcps(py, event, &reg.sched, transport, &mut cb_handles);
+                            }
+                            IOHandle::UDPSocket(transport) => {
+                                Self::handle_io_udp(py, event, &reg.sched, transport, &mut cb_handles);
+                            }
+                        }
                     }
                 }
             }
@@ -213,22 +236,20 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_io_py(
-        &self,
-        py: Python,
-        event: &event::Event,
-        handle: &PyHandleData,
-        handles: &mut VecDeque<BoxedHandle>,
-    ) {
-        if let Some(cbr) = &handle.cbr
-            && event.is_readable()
-        {
-            handles.push_back(Box::new(cbr.clone_ref(py)));
+    fn handle_io_py(event: &event::Event, handle: &Arc<Mutex<PyHandleData>>, handles: &mut VecDeque<BoxedHandle>) {
+        let closed = event.is_read_closed() || event.is_write_closed() || event.is_error();
+        let guard = handle.lock().unwrap();
+        if guard.cbr.is_some() && (event.is_readable() || closed) {
+            handles.push_back(Box::new(CBLTHandle {
+                data: handle.clone(),
+                write: false,
+            }));
         }
-        if let Some(cbw) = &handle.cbw
-            && event.is_writable()
-        {
-            handles.push_back(Box::new(cbw.clone_ref(py)));
+        if guard.cbw.is_some() && (event.is_writable() || closed) {
+            handles.push_back(Box::new(CBLTHandle {
+                data: handle.clone(),
+                write: true,
+            }));
         }
     }
 
@@ -253,117 +274,28 @@ impl EventLoop {
         }
     }
 
-    pub(crate) fn py_sock_cleanup(&self, data: &Arc<Mutex<PySockHandleData>>) {
-        let mut remove = false;
-        let fd;
-        {
-            let mut guard = data.lock().unwrap();
-            fd = guard.fd;
-            let interest = match (guard.reader.is_some(), guard.writer.is_some()) {
-                (false, false) => None,
-                (true, false) => Some(Interest::READABLE),
-                (false, true) => Some(Interest::WRITABLE),
-                (true, true) => Some(Interest::READABLE | Interest::WRITABLE),
-            };
-            match interest {
-                None => remove = true,
-                Some(interest) => {
-                    if guard.interest != interest {
-                        let mut source = Source::FD(fd);
-                        let guard_poll = self.io.lock().unwrap();
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            _ = guard_poll
-                                .registry()
-                                .reregister(&mut source, Token(fd as usize), interest);
-                        }
-                        guard.interest = interest;
-                    }
-                }
-            }
-        }
-        if remove {
-            #[allow(clippy::cast_sign_loss)]
-            self.handles_io.pin().remove(&Token(fd as usize));
-            let mut source = Source::FD(fd);
-            let guard_poll = self.io.lock().unwrap();
-            _ = guard_poll.registry().deregister(&mut source);
-        }
-    }
-
-    fn py_sock_op_add(&self, fd: usize, op: PySockOp, write: bool) -> PyResult<()> {
-        let token = Token(fd);
-        let interest_op = match write {
-            true => Interest::WRITABLE,
-            false => Interest::READABLE,
-        };
-        let handles = self.handles_io.pin();
-        match handles.get(&token) {
-            None => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    guard_poll.registry().register(&mut source, token, interest_op)?;
-                }
-                #[allow(clippy::cast_possible_wrap)]
-                handles.insert(
-                    token,
-                    IOHandle::PySock(Arc::new(Mutex::new(PySockHandleData::new(fd as i32, op, interest_op)))),
-                );
-                Ok(())
-            }
-            Some(IOHandle::PySock(handle)) => {
-                let mut guard = handle.lock().unwrap();
-                let slot = match write {
-                    true => &mut guard.writer,
-                    false => &mut guard.reader,
-                };
-                if slot.is_some() {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "File descriptor {fd} already has a pending socket operation"
-                    )));
-                }
-                *slot = Some(op);
-                let interest = guard.interest | interest_op;
-                if guard.interest != interest {
-                    #[allow(clippy::cast_possible_wrap)]
-                    let mut source = Source::FD(fd as i32);
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().reregister(&mut source, token, interest);
-                    guard.interest = interest;
-                }
-                Ok(())
-            }
-            Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "File descriptor {fd} is used by another handle"
-            ))),
-        }
-    }
-
     #[inline]
-    fn handle_io_tcpl(
-        &self,
-        py: Python,
-        handle: &TCPListenerHandleData,
-        io_handles: &papaya::HashMapRef<'_, Token, IOHandle, std::hash::RandomState, papaya::LocalGuard<'_>>,
-        handles: &mut VecDeque<BoxedHandle>,
-    ) {
+    fn handle_io_tcpl(&self, py: Python, handle: &TCPListenerHandleData, handles: &mut VecDeque<BoxedHandle>) {
         if let Source::TCPListener(listener) = &handle.source {
-            let guard_poll = self.io.lock().unwrap();
             let transports = self.tcp_transports.pin();
             let streams = self.tcp_lstreams.pin();
             let lstreams = streams.get(&handle.server.fd).unwrap().pin();
             while let Ok((stream, _)) = listener.accept() {
                 let fd = stream.as_raw_fd() as usize;
-                let token = Token(fd);
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
+
+                #[allow(clippy::cast_possible_wrap)]
+                let reg = Arc::new(IORegistration {
+                    sched: ScheduledIO::new(fd as i32, true, false),
+                    handle: IOHandle::TCPStream(pytransport.clone_ref(py)),
+                });
+                pytransport.borrow(py).io_attach(&reg);
                 transports.insert(fd, pytransport);
                 lstreams.insert(fd);
-                _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
-                io_handles.insert(Token(fd), IOHandle::TCPStream(Interest::READABLE));
+
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                _ = self.io_register(&reg, &mut source, Interest::READABLE | Interest::WRITABLE);
                 handles.push_back(stream_handle);
             }
             return;
@@ -372,33 +304,57 @@ impl EventLoop {
     }
 
     #[inline]
-    fn handle_io_tcps(&self, py: Python, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
-        if let Some(transport) = self.tcp_transports.pin().get(&event.token().0) {
-            if event.is_readable() {
+    fn handle_io_tcps(
+        py: Python,
+        event: &event::Event,
+        sched: &ScheduledIO,
+        transport: &Py<TCPTransport>,
+        handles_ready: &mut VecDeque<BoxedHandle>,
+    ) {
+        if event.is_readable() {
+            if sched.armed_r() {
                 handles_ready.push_back(Box::new(TCPReadHandle {
                     transport: transport.clone_ref(py),
                 }));
+            } else {
+                sched.set_ready_r();
             }
-            if event.is_writable() {
+        }
+        if event.is_writable() {
+            if sched.armed_w() {
                 handles_ready.push_back(Box::new(TCPWriteHandle {
                     transport: transport.clone_ref(py),
                 }));
+            } else {
+                sched.set_ready_w();
             }
         }
     }
 
     #[inline]
-    fn handle_io_udp(&self, py: Python, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
-        if let Some(transport) = self.udp_transports.pin().get(&event.token().0) {
-            if event.is_readable() {
+    fn handle_io_udp(
+        py: Python,
+        event: &event::Event,
+        sched: &ScheduledIO,
+        transport: &Py<UDPTransport>,
+        handles_ready: &mut VecDeque<BoxedHandle>,
+    ) {
+        if event.is_readable() {
+            if sched.armed_r() {
                 handles_ready.push_back(Box::new(UDPReadHandle {
                     transport: transport.clone_ref(py),
                 }));
+            } else {
+                sched.set_ready_r();
             }
-            if event.is_writable() {
+        }
+        if event.is_writable() {
+            if sched.armed_w() {
                 handles_ready.push_back(Box::new(UDPWriteHandle {
                     transport: transport.clone_ref(py),
                 }));
+            } else {
+                sched.set_ready_w();
             }
         }
     }
@@ -436,101 +392,137 @@ impl EventLoop {
         }
     }
 
+    fn io_register(&self, reg: &Arc<IORegistration>, source: &mut Source, interest: Interest) -> std::io::Result<()> {
+        let token = Token(Arc::as_ptr(reg).expose_provenance());
+        {
+            let guard_poll = self.io.lock().unwrap();
+            guard_poll.registry().register(source, token, interest)?;
+        }
+        {
+            let map = self.handles_fd.pin();
+            #[allow(clippy::cast_sign_loss)]
+            if let Some(old) = map.insert(reg.sched.fd as usize, reg.clone()) {
+                self.io_pending_release.lock().unwrap().push(old.clone());
+                self.io_needs_release.store(true, atomic::Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    fn io_reregister(&self, reg: &Arc<IORegistration>, interest: Interest) {
+        let token = Token(Arc::as_ptr(reg).expose_provenance());
+        let mut source = Source::FD(reg.sched.fd);
+        let guard_poll = self.io.lock().unwrap();
+        _ = guard_poll.registry().reregister(&mut source, token, interest);
+    }
+
+    pub(crate) fn io_unregister(&self, fd: usize) -> bool {
+        let Some(reg) = ({
+            let map = self.handles_fd.pin();
+            map.remove(&fd).map(Arc::clone)
+        }) else {
+            return false;
+        };
+        {
+            let mut source = Source::FD(reg.sched.fd);
+            let guard_poll = self.io.lock().unwrap();
+            _ = guard_poll.registry().deregister(&mut source);
+        }
+        self.io_pending_release.lock().unwrap().push(reg);
+        self.io_needs_release.store(true, atomic::Ordering::Release);
+        true
+    }
+
+    #[inline(always)]
+    fn sock_ref_valid(py: Python, sock_ref: Option<&Py<PyAny>>, sock: &Bound<PyAny>) -> bool {
+        match sock_ref {
+            Some(wref) => wref.call0(py).is_ok_and(|obj| obj.as_ptr() == sock.as_ptr()),
+            None => false,
+        }
+    }
+
+    fn sock_op_add(&self, py: Python, fd: usize, sock: &Bound<PyAny>, op: PySockOp, write: bool) -> PyResult<()> {
+        let map = self.handles_fd.pin();
+        if let Some(reg) = map.get(&fd) {
+            match &reg.handle {
+                IOHandle::PySock(handle) => {
+                    let mut guard = handle.lock().unwrap();
+                    if EventLoop::sock_ref_valid(py, guard.sock_ref.as_ref(), sock) {
+                        let slot = match write {
+                            true => &mut guard.writer,
+                            false => &mut guard.reader,
+                        };
+                        if slot.is_some() {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "File descriptor {fd} already has a pending socket operation"
+                            )));
+                        }
+                        *slot = Some(op);
+                        return Ok(());
+                    }
+                    drop(guard);
+                    self.io_unregister(fd);
+                }
+                _ => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "File descriptor {fd} is used by another handle"
+                    )));
+                }
+            }
+        }
+
+        let sock_ref = unsafe {
+            Bound::from_owned_ptr_or_err(py, pyo3::ffi::PyWeakref_NewRef(sock.as_ptr(), std::ptr::null_mut()))
+        }
+        .map_or_else(
+            |_| {
+                unsafe { pyo3::ffi::PyErr_Clear() };
+                None
+            },
+            |v| Some(v.unbind()),
+        );
+
+        #[allow(clippy::cast_possible_wrap)]
+        let reg = Arc::new(IORegistration {
+            sched: ScheduledIO::new(fd as i32, false, false),
+            handle: IOHandle::PySock(Arc::new(Mutex::new(PySockHandleData::new(
+                fd as i32, sock_ref, op, write,
+            )))),
+        });
+
+        #[allow(clippy::cast_possible_wrap)]
+        let mut source = Source::FD(fd as i32);
+        self.io_register(&reg, &mut source, Interest::READABLE | Interest::WRITABLE)?;
+
+        Ok(())
+    }
+
     pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
         let fd = listener.as_raw_fd() as usize;
-        let token = Token(fd);
-        let mut source = Source::TCPListener(listener);
-        let guard_poll = self.io.lock().unwrap();
-        let _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
+
+        #[allow(clippy::cast_possible_wrap)]
+        let reg = Arc::new(IORegistration {
+            sched: ScheduledIO::new(fd as i32, true, false),
+            handle: IOHandle::TCPListener(TCPListenerHandleData {
+                source: Source::TCPListener(listener),
+                server,
+            }),
+        });
         self.tcp_lstreams.pin().insert(fd, papaya::HashSet::new());
-        self.handles_io
-            .pin()
-            .insert(token, IOHandle::TCPListener(TCPListenerHandleData { source, server }));
+
+        #[allow(clippy::cast_possible_wrap)]
+        let mut source = Source::FD(fd as i32);
+        _ = self.io_register(&reg, &mut source, Interest::READABLE);
     }
 
-    pub(crate) fn tcp_listener_rem(&self, fd: usize) -> Result<bool> {
-        let token = Token(fd);
-        if let Some(handle) = self.handles_io.pin().remove(&token) {
-            if let IOHandle::TCPListener(_) = handle {
-                self.tcp_lstreams.pin().remove(&fd);
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                guard_poll.registry().deregister(&mut source)?;
-                return Ok(true);
-            }
-            unreachable!()
-        }
-        Ok(false)
-    }
-
-    pub(crate) fn tcp_stream_add(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-        self.handles_io.pin().update_or_insert_with(
-            token,
-            |io_handle| {
-                if let IOHandle::TCPStream(interest_prev) = io_handle {
-                    if *interest_prev == interest {
-                        return IOHandle::TCPStream(interest);
-                    }
-
-                    let interests = *interest_prev | interest;
-                    {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interests);
-                    }
-                    return IOHandle::TCPStream(interests);
-                }
-                unreachable!()
-            },
-            || {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().register(&mut source, token, interest);
-                }
-                IOHandle::TCPStream(interest)
-            },
-        );
-    }
-
-    pub(crate) fn tcp_stream_rem(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-
-        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
-            if let IOHandle::TCPStream(interest_ex) = io_handle {
-                return *interest_ex == interest;
-            }
-            false
-        }) {
-            Ok(None) => {}
-            Ok(_) => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                _ = guard_poll.registry().deregister(&mut source);
-            }
-            _ => {
-                self.handles_io.pin().update(token, |io_handle| {
-                    if let IOHandle::TCPStream(interest_ex) = io_handle {
-                        let interest_new = interest_ex.remove(interest).unwrap();
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interest_new);
-                        return IOHandle::TCPStream(interest_new);
-                    }
-                    unreachable!()
-                });
-            }
-        }
+    pub(crate) fn tcp_listener_rem(&self, fd: usize) -> bool {
+        self.tcp_lstreams.pin().remove(&fd);
+        self.io_unregister(fd)
     }
 
     #[inline(always)]
     pub(crate) fn tcp_stream_close(&self, py: Python, fd: usize) {
+        self.io_unregister(fd);
         if let Some(transport) = self.tcp_transports.pin().remove(&fd)
             && let Some(lfd) = transport.borrow(py).lfd
         {
@@ -553,74 +545,8 @@ impl EventLoop {
     }
 
     #[inline]
-    pub(crate) fn udp_socket_add(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-        self.handles_io.pin().update_or_insert_with(
-            token,
-            |io_handle| {
-                if let IOHandle::UDPSocket(interest_prev) = io_handle {
-                    if *interest_prev == interest {
-                        return IOHandle::UDPSocket(interest);
-                    }
-
-                    let interests = *interest_prev | interest;
-                    {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interests);
-                    }
-                    return IOHandle::UDPSocket(interests);
-                }
-                unreachable!()
-            },
-            || {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().register(&mut source, token, interest);
-                }
-                IOHandle::UDPSocket(interest)
-            },
-        );
-    }
-
-    #[inline]
-    pub(crate) fn udp_socket_rem(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-
-        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
-            if let IOHandle::UDPSocket(interest_ex) = io_handle {
-                return *interest_ex == interest;
-            }
-            false
-        }) {
-            Ok(None) => {}
-            Ok(_) => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                _ = guard_poll.registry().deregister(&mut source);
-            }
-            _ => {
-                self.handles_io.pin().update(token, |io_handle| {
-                    if let IOHandle::UDPSocket(interest_ex) = io_handle {
-                        let interest_new = interest_ex.remove(interest).unwrap();
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interest_new);
-                        return IOHandle::UDPSocket(interest_new);
-                    }
-                    unreachable!()
-                });
-            }
-        }
-    }
-
-    #[inline]
     pub(crate) fn udp_socket_close(&self, fd: usize) {
+        self.io_unregister(fd);
         self.udp_transports.pin().remove(&fd);
     }
 
@@ -824,13 +750,15 @@ impl EventLoop {
     #[new]
     fn new(py: Python) -> PyResult<Self> {
         let poll = Poll::new()?;
-        let waker = Waker::new(poll.registry(), Token(0))?;
+        let waker = Waker::new(poll.registry(), Token(TOKEN_WAKER))?;
 
         Ok(Self {
             idle: atomic::AtomicBool::new(false),
             io: Mutex::new(poll),
             waker: Arc::new(waker),
-            handles_io: papaya::HashMap::with_capacity(128),
+            handles_fd: papaya::HashMap::with_capacity(128),
+            io_pending_release: Mutex::new(Vec::new()),
+            io_needs_release: atomic::AtomicBool::new(false),
             handles_ready: Mutex::new(VecDeque::with_capacity(128)),
             handles_sched: Mutex::new(BinaryHeap::with_capacity(32)),
             epoch: Instant::now(),
@@ -1026,22 +954,20 @@ impl EventLoop {
             });
         }
 
-        let token = Token(fd_r);
         let mut source = Source::FD(fd_r.try_into()?);
-        let interest = Interest::READABLE;
 
         {
             let guard_poll = self.io.lock().unwrap();
-            guard_poll.registry().register(&mut source, token, interest)?;
+            guard_poll
+                .registry()
+                .register(&mut source, Token(TOKEN_SIGNALS), Interest::READABLE)?;
         }
-        self.handles_io.pin().insert(token, IOHandle::Signals);
 
         Ok(())
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
-        let token = Token(fd_r);
-        if let Some(IOHandle::Signals) = self.handles_io.pin().remove(&token) {
+        {
             #[allow(clippy::cast_possible_wrap)]
             let mut source = Source::FD(fd_r as i32);
             let guard_poll = self.io.lock().unwrap();
@@ -1127,85 +1053,84 @@ impl EventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> Py<CBHandle> {
-        let token = Token(fd);
         let handle = Py::new(
             py,
             CBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py))),
         )
         .unwrap();
 
-        self.handles_io.pin().update_or_insert_with(
-            token,
-            |io_handle| {
-                if let IOHandle::Py(data) = io_handle {
-                    let interest = data.interest | Interest::READABLE;
-                    #[allow(clippy::cast_possible_wrap)]
-                    let mut source = Source::FD(fd as i32);
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().reregister(&mut source, token, interest);
-                    return IOHandle::Py(PyHandleData {
-                        interest,
-                        cbr: Some(handle.clone_ref(py)),
-                        cbw: data.cbw.as_ref().map(|v| v.clone_ref(py)),
-                    });
+        let map = self.handles_fd.pin();
+        let mut create = true;
+        if let Some(reg) = map.get(&fd) {
+            match &reg.handle {
+                IOHandle::Py(data) => {
+                    let mut guard = data.lock().unwrap();
+                    guard.cbr = Some(handle.clone_ref(py));
+                    let interest = guard.interest | Interest::READABLE;
+                    if interest != guard.interest {
+                        guard.interest = interest;
+                        self.io_reregister(reg, interest);
+                    }
+                    create = false;
                 }
-                unreachable!()
-            },
-            || {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let interest = Interest::READABLE;
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().register(&mut source, token, interest);
+                IOHandle::PySock(data) => {
+                    let guard = data.lock().unwrap();
+                    if guard.reader.is_some() || guard.writer.is_some() {
+                        unreachable!()
+                    }
+                    drop(guard);
+                    self.io_unregister(fd);
                 }
-                IOHandle::Py(PyHandleData {
-                    interest,
+                _ => unreachable!(),
+            }
+        }
+        if create {
+            #[allow(clippy::cast_possible_wrap)]
+            let reg = Arc::new(IORegistration {
+                sched: ScheduledIO::new(fd as i32, false, false),
+                handle: IOHandle::Py(Arc::new(Mutex::new(PyHandleData {
+                    fd: fd as i32,
+                    interest: Interest::READABLE,
                     cbr: Some(handle.clone_ref(py)),
                     cbw: None,
-                })
-            },
-        );
+                }))),
+            });
+            #[allow(clippy::cast_possible_wrap)]
+            let mut source = Source::FD(fd as i32);
+            _ = self.io_register(&reg, &mut source, Interest::READABLE);
+        }
 
         handle
     }
 
-    fn remove_reader(&self, py: Python, fd: usize) -> bool {
-        let token = Token(fd);
-
-        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
-            if let IOHandle::Py(data) = io_handle {
-                return data.interest == Interest::READABLE;
-            }
-            false
-        }) {
-            Ok(None) => false,
-            Ok(_) => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                _ = guard_poll.registry().deregister(&mut source);
-                true
-            }
-            _ => {
-                self.handles_io.pin().update(token, |io_handle| {
-                    if let IOHandle::Py(data) = io_handle {
-                        let interest = Interest::WRITABLE;
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interest);
-                        return IOHandle::Py(PyHandleData {
-                            interest,
-                            cbr: None,
-                            cbw: Some(data.cbw.as_ref().unwrap().clone_ref(py)),
-                        });
+    fn remove_reader(&self, _py: Python, fd: usize) -> bool {
+        let existed;
+        let unregister;
+        {
+            let map = self.handles_fd.pin();
+            let Some(reg) = map.get(&fd) else {
+                return false;
+            };
+            let IOHandle::Py(data) = &reg.handle else {
+                unreachable!()
+            };
+            let mut guard = data.lock().unwrap();
+            existed = guard.cbr.take().is_some();
+            match guard.cbw.is_some() {
+                true => {
+                    unregister = false;
+                    if guard.interest != Interest::WRITABLE {
+                        guard.interest = Interest::WRITABLE;
+                        self.io_reregister(reg, Interest::WRITABLE);
                     }
-                    unreachable!()
-                });
-                true
+                }
+                false => unregister = true,
             }
         }
+        if unregister {
+            self.io_unregister(fd);
+        }
+        existed
     }
 
     #[pyo3(signature = (fd, callback, *args, context=None))]
@@ -1217,96 +1142,110 @@ impl EventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> Py<CBHandle> {
-        let token = Token(fd);
         let handle = Py::new(
             py,
             CBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py))),
         )
         .unwrap();
 
-        self.handles_io.pin().update_or_insert_with(
-            token,
-            |io_handle| {
-                if let IOHandle::Py(data) = io_handle {
-                    let interest = data.interest | Interest::WRITABLE;
-                    #[allow(clippy::cast_possible_wrap)]
-                    let mut source = Source::FD(fd as i32);
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().reregister(&mut source, token, interest);
-                    return IOHandle::Py(PyHandleData {
-                        interest,
-                        cbr: data.cbr.as_ref().map(|v| v.clone_ref(py)),
-                        cbw: Some(handle.clone_ref(py)),
-                    });
+        let map = self.handles_fd.pin();
+        let mut create = true;
+        if let Some(reg) = map.get(&fd) {
+            match &reg.handle {
+                IOHandle::Py(data) => {
+                    let mut guard = data.lock().unwrap();
+                    guard.cbw = Some(handle.clone_ref(py));
+                    let interest = guard.interest | Interest::WRITABLE;
+                    if interest != guard.interest {
+                        guard.interest = interest;
+                        self.io_reregister(reg, interest);
+                    }
+                    create = false;
                 }
-                unreachable!()
-            },
-            || {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let interest = Interest::WRITABLE;
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().register(&mut source, token, interest);
+                IOHandle::PySock(data) => {
+                    let guard = data.lock().unwrap();
+                    if guard.reader.is_some() || guard.writer.is_some() {
+                        unreachable!()
+                    }
+                    drop(guard);
+                    self.io_unregister(fd);
                 }
-                IOHandle::Py(PyHandleData {
-                    interest,
+                _ => unreachable!(),
+            }
+        }
+        if create {
+            #[allow(clippy::cast_possible_wrap)]
+            let reg = Arc::new(IORegistration {
+                sched: ScheduledIO::new(fd as i32, false, false),
+                handle: IOHandle::Py(Arc::new(Mutex::new(PyHandleData {
+                    fd: fd as i32,
+                    interest: Interest::WRITABLE,
                     cbr: None,
                     cbw: Some(handle.clone_ref(py)),
-                })
-            },
-        );
+                }))),
+            });
+            #[allow(clippy::cast_possible_wrap)]
+            let mut source = Source::FD(fd as i32);
+            _ = self.io_register(&reg, &mut source, Interest::WRITABLE);
+        }
 
         handle
     }
 
-    fn remove_writer(&self, py: Python, fd: usize) -> bool {
-        let token = Token(fd);
-
-        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
-            if let IOHandle::Py(data) = io_handle {
-                return data.interest == Interest::WRITABLE;
-            }
-            false
-        }) {
-            Ok(None) => false,
-            Ok(_) => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                _ = guard_poll.registry().deregister(&mut source);
-                true
-            }
-            _ => {
-                self.handles_io.pin().update(token, |io_handle| {
-                    if let IOHandle::Py(data) = io_handle {
-                        let interest = Interest::READABLE;
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interest);
-                        return IOHandle::Py(PyHandleData {
-                            interest,
-                            cbr: Some(data.cbr.as_ref().unwrap().clone_ref(py)),
-                            cbw: None,
-                        });
+    fn remove_writer(&self, _py: Python, fd: usize) -> bool {
+        let existed;
+        let unregister;
+        {
+            let map = self.handles_fd.pin();
+            let Some(reg) = map.get(&fd) else {
+                return false;
+            };
+            let IOHandle::Py(data) = &reg.handle else {
+                unreachable!()
+            };
+            let mut guard = data.lock().unwrap();
+            existed = guard.cbw.take().is_some();
+            match guard.cbr.is_some() {
+                true => {
+                    unregister = false;
+                    if guard.interest != Interest::READABLE {
+                        guard.interest = Interest::READABLE;
+                        self.io_reregister(reg, Interest::READABLE);
                     }
-                    unreachable!()
-                });
-                true
+                }
+                false => unregister = true,
             }
         }
+        if unregister {
+            self.io_unregister(fd);
+        }
+        existed
     }
 
-    fn _sock_recv_native(&self, fd: usize, fut: Py<PyAny>, n: usize) -> PyResult<()> {
-        self.py_sock_op_add(fd, PySockOp::Recv { fut, n }, false)
+    fn _sock_recv_native(&self, py: Python, fd: usize, sock: &Bound<PyAny>, fut: Py<PyAny>, n: usize) -> PyResult<()> {
+        self.sock_op_add(py, fd, sock, PySockOp::Recv { fut, n }, false)
     }
 
-    fn _sock_recv_into_native(&self, fd: usize, fut: Py<PyAny>, buf: Py<PyAny>) -> PyResult<()> {
-        self.py_sock_op_add(fd, PySockOp::RecvInto { fut, buf }, false)
+    fn _sock_recv_into_native(
+        &self,
+        py: Python,
+        fd: usize,
+        sock: &Bound<PyAny>,
+        fut: Py<PyAny>,
+        buf: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.sock_op_add(py, fd, sock, PySockOp::RecvInto { fut, buf }, false)
     }
 
-    fn _sock_sendall_native(&self, fd: usize, fut: Py<PyAny>, data: &Bound<PyAny>, sent: usize) -> PyResult<()> {
+    fn _sock_sendall_native(
+        &self,
+        py: Python,
+        fd: usize,
+        sock: &Bound<PyAny>,
+        fut: Py<PyAny>,
+        data: &Bound<PyAny>,
+        sent: usize,
+    ) -> PyResult<()> {
         let chunk = match data.cast::<pyo3::types::PyBytes>() {
             Ok(pybytes) => WriteChunk::py(pybytes, sent),
             _ => {
@@ -1314,28 +1253,23 @@ impl EventLoop {
                 WriteChunk::owned((&bytes[sent..]).into())
             }
         };
-        self.py_sock_op_add(fd, PySockOp::SendAll { fut, chunk }, true)
+        self.sock_op_add(py, fd, sock, PySockOp::SendAll { fut, chunk }, true)
     }
 
     fn _sock_op_cancel(&self, fd: usize, write: bool) {
-        let token = Token(fd);
-        let data = {
-            let handles = self.handles_io.pin();
-            let Some(IOHandle::PySock(handle)) = handles.get(&token) else {
-                return;
-            };
-            let mut guard = handle.lock().unwrap();
-            let slot = match write {
-                true => &mut guard.writer,
-                false => &mut guard.reader,
-            };
-            if slot.take().is_none() {
-                return;
-            }
-            drop(guard);
-            handle.clone()
+        let map = self.handles_fd.pin();
+        let Some(reg) = map.get(&fd) else {
+            return;
         };
-        self.py_sock_cleanup(&data);
+        let IOHandle::PySock(handle) = &reg.handle else {
+            return;
+        };
+        let mut guard = handle.lock().unwrap();
+        let slot = match write {
+            true => &mut guard.writer,
+            false => &mut guard.reader,
+        };
+        _ = slot.take();
     }
 
     fn _tcp_conn(
@@ -1348,9 +1282,20 @@ impl EventLoop {
         let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
         let fd = transport.fd;
         let pytransport = Py::new(py, transport)?;
-        let proto = TCPTransport::attach(&pytransport, py)?;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let reg = Arc::new(IORegistration {
+            sched: ScheduledIO::new(fd as i32, true, false),
+            handle: IOHandle::TCPStream(pytransport.clone_ref(py)),
+        });
+        pytransport.borrow(py).io_attach(&reg);
         rself.tcp_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.tcp_stream_add(fd, Interest::READABLE);
+
+        #[allow(clippy::cast_possible_wrap)]
+        let mut source = Source::FD(fd as i32);
+        _ = rself.io_register(&reg, &mut source, Interest::READABLE | Interest::WRITABLE);
+
+        let proto = TCPTransport::attach(&pytransport, py)?;
         Ok((pytransport, proto))
     }
 
@@ -1390,9 +1335,20 @@ impl EventLoop {
         let transport = UDPTransport::from_py(py, &pyself, sock, protocol_factory, remote_addr);
         let fd = transport.fd;
         let pytransport = Py::new(py, transport)?;
-        let proto = UDPTransport::attach(&pytransport, py)?;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let reg = Arc::new(IORegistration {
+            sched: ScheduledIO::new(fd as i32, true, false),
+            handle: IOHandle::UDPSocket(pytransport.clone_ref(py)),
+        });
+        pytransport.borrow(py).io_attach(&reg);
         rself.udp_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.udp_socket_add(fd, Interest::READABLE);
+
+        #[allow(clippy::cast_possible_wrap)]
+        let mut source = Source::FD(fd as i32);
+        _ = rself.io_register(&reg, &mut source, Interest::READABLE | Interest::WRITABLE);
+
+        let proto = UDPTransport::attach(&pytransport, py)?;
         Ok((pytransport, proto))
     }
 
@@ -1428,7 +1384,8 @@ impl EventLoop {
                     if self.sig_loop_handled.swap(false, atomic::Ordering::Relaxed) {
                         continue;
                     }
-                    break;
+                    py.check_signals()?;
+                    continue;
                 }
                 return Err(err.into());
             }

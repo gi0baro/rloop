@@ -1,4 +1,3 @@
-use mio::Interest;
 use pyo3::{IntoPyObjectExt, buffer::PyBuffer, prelude::*, types::PyTuple};
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex, atomic};
@@ -159,20 +158,20 @@ unsafe impl Send for PySockOp {}
 
 pub(crate) struct PySockHandleData {
     pub fd: i32,
-    pub interest: Interest,
+    pub sock_ref: Option<Py<PyAny>>,
     pub reader: Option<PySockOp>,
     pub writer: Option<PySockOp>,
 }
 
 impl PySockHandleData {
-    pub(crate) fn new(fd: i32, op: PySockOp, interest: Interest) -> Self {
-        let (reader, writer) = match interest.is_writable() {
+    pub(crate) fn new(fd: i32, sock_ref: Option<Py<PyAny>>, op: PySockOp, write: bool) -> Self {
+        let (reader, writer) = match write {
             true => (None, Some(op)),
             false => (Some(op), None),
         };
         Self {
             fd,
-            interest,
+            sock_ref,
             reader,
             writer,
         }
@@ -307,24 +306,21 @@ pub(crate) struct PySockOpHandle {
 }
 
 impl Handle for PySockOpHandle {
-    fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        {
-            let mut guard = self.data.lock().unwrap();
-            let fd = guard.fd;
-            let slot = match self.write {
-                true => &mut guard.writer,
-                false => &mut guard.reader,
-            };
-            let Some(op) = slot else {
-                return;
-            };
-            match op.run(py, fd) {
-                PySockOpOutcome::Pending => return,
-                PySockOpOutcome::Done => {
-                    *slot = None;
-                }
+    fn run(&self, py: Python, _event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        let mut guard = self.data.lock().unwrap();
+        let fd = guard.fd;
+        let slot = match self.write {
+            true => &mut guard.writer,
+            false => &mut guard.reader,
+        };
+        let Some(op) = slot else {
+            return;
+        };
+        match op.run(py, fd) {
+            PySockOpOutcome::Pending => {}
+            PySockOpOutcome::Done => {
+                *slot = None;
             }
         }
-        event_loop.py_sock_cleanup(&self.data);
     }
 }

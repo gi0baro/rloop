@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 
-use mio::{Interest, net::UdpSocket};
+use mio::net::UdpSocket;
 use pyo3::{IntoPyObject, prelude::*, types::PyBytes};
 use std::{
     borrow::Cow,
@@ -10,11 +10,11 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::atomic,
+    sync::{Arc, OnceLock, Weak, atomic},
 };
 
 use crate::{
-    event_loop::{EventLoop, EventLoopRunState},
+    event_loop::{EventLoop, EventLoopRunState, IORegistration},
     handles::Handle,
     log::LogExc,
     sock::SocketWrapper,
@@ -31,6 +31,7 @@ struct UDPTransportState {
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
 pub(crate) struct UDPTransport {
     pub fd: usize,
+    io: OnceLock<Weak<IORegistration>>,
     state: RefCell<UDPTransportState>,
     pyloop: Py<EventLoop>,
     // atomics
@@ -87,6 +88,7 @@ impl UDPTransport {
             fd,
             state: RefCell::new(state),
             pyloop,
+            io: OnceLock::new(),
             closing: false.into(),
             conn_lost: false.into(),
             water_hi: wh.into(),
@@ -125,6 +127,15 @@ impl UDPTransport {
             .proto
             .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
         Ok(rself.proto.clone_ref(py))
+    }
+
+    pub(crate) fn io_attach(&self, reg: &Arc<IORegistration>) {
+        _ = self.io.set(Arc::downgrade(reg));
+    }
+
+    #[inline]
+    fn io_reg(&self) -> Option<Arc<IORegistration>> {
+        self.io.get().and_then(Weak::upgrade)
     }
 
     #[inline]
@@ -167,6 +178,7 @@ impl UDPTransport {
             state.write_buf_dsize = 0;
         }
         _ = self.protom_conn_lost.call1(py, (exc,));
+        self.pyloop.get().udp_socket_close(self.fd);
     }
 
     #[inline]
@@ -203,16 +215,18 @@ impl UDPTransport {
                         data.len()
                     }
                     Err(err) => {
-                        if state.write_buf_dsize > 0 {
-                            // reset buf_dsize?
-                            rself.pyloop.get().udp_socket_rem(rself.fd, Interest::WRITABLE);
+                        if state.write_buf_dsize > 0
+                            && let Some(reg) = rself.io_reg()
+                        {
+                            reg.sched.disarm_w();
                         }
                         if rself
                             .closing
                             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
                             .is_ok()
+                            && let Some(reg) = rself.io_reg()
                         {
-                            rself.pyloop.get().udp_socket_rem(rself.fd, Interest::READABLE);
+                            reg.sched.disarm_r();
                         }
                         conn_err = Some(err);
                         0
@@ -226,8 +240,11 @@ impl UDPTransport {
         };
 
         if buf_added > 0 {
-            if state.write_buf_dsize == 0 {
-                rself.pyloop.get().udp_socket_add(rself.fd, Interest::WRITABLE);
+            if state.write_buf_dsize == 0
+                && let Some(reg) = rself.io_reg()
+            {
+                reg.sched.arm_w();
+                reg.sched.clear_ready_w();
             }
             state.write_buf_dsize += buf_added;
             if state.write_buf_dsize > rself.water_hi.load(atomic::Ordering::Relaxed)
@@ -312,25 +329,32 @@ impl UDPTransport {
             return;
         }
 
-        let event_loop = self.pyloop.get();
-        event_loop.udp_socket_rem(self.fd, Interest::READABLE);
+        if let Some(reg) = self.io_reg() {
+            reg.sched.disarm_r();
+        }
         let buf_empty = self.state.borrow().write_buf_dsize == 0;
         if buf_empty {
-            event_loop.udp_socket_rem(self.fd, Interest::WRITABLE);
+            if let Some(reg) = self.io_reg() {
+                reg.sched.disarm_w();
+            }
             self.call_conn_lost(py, None);
         }
     }
 
     fn abort(&self, py: Python) {
-        if self.state.borrow().write_buf_dsize > 0 {
-            self.pyloop.get().udp_socket_rem(self.fd, Interest::WRITABLE);
-        }
-        if self
-            .closing
-            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
-            .is_ok()
-        {
-            self.pyloop.get().udp_socket_rem(self.fd, Interest::READABLE);
+        if let Some(reg) = self.io_reg() {
+            if self.state.borrow().write_buf_dsize > 0 {
+                reg.sched.disarm_w();
+            }
+            if self
+                .closing
+                .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                reg.sched.disarm_r();
+            }
+        } else {
+            self.closing.store(true, atomic::Ordering::Relaxed);
         }
         self.call_conn_lost(py, None);
     }
@@ -525,8 +549,8 @@ impl Handle for UDPWriteHandle {
         }
 
         let buf_empty = transport.state.borrow().write_buf.is_empty();
-        if buf_empty {
-            event_loop.udp_socket_rem(transport.fd, Interest::WRITABLE);
+        if buf_empty && let Some(reg) = transport.io_reg() {
+            reg.sched.disarm_w();
         }
         if stream_close {
             event_loop.udp_socket_close(transport.fd);
