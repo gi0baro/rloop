@@ -266,7 +266,8 @@ impl EventLoop {
                 handles_ready.push_back(Box::new(TCPReadHandle {
                     transport: transport.clone_ref(py),
                 }));
-            } else if event.is_writable() {
+            }
+            if event.is_writable() {
                 handles_ready.push_back(Box::new(TCPWriteHandle {
                     transport: transport.clone_ref(py),
                 }));
@@ -281,7 +282,8 @@ impl EventLoop {
                 handles_ready.push_back(Box::new(UDPReadHandle {
                     transport: transport.clone_ref(py),
                 }));
-            } else if event.is_writable() {
+            }
+            if event.is_writable() {
                 handles_ready.push_back(Box::new(UDPWriteHandle {
                     transport: transport.clone_ref(py),
                 }));
