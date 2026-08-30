@@ -1,4 +1,6 @@
+import asyncio
 import socket
+import time
 
 
 _SIZE = 1024 * 1024
@@ -68,3 +70,41 @@ def test_socket_accept_send(loop):
 
     loop.run_until_complete(server())
     assert state['data'] == b'a' * _SIZE
+
+
+def test_socket_recv_cancel(loop):
+    async def server():
+        sock = socket.socket()
+        sock.setblocking(False)
+
+        with sock:
+            sock.bind(('127.0.0.1', 0))
+            sock.listen()
+
+            fut = loop.run_in_executor(None, client, sock.getsockname())
+
+            client_sock, _ = await loop.sock_accept(sock)
+            with client_sock:
+                task = loop.create_task(loop.sock_recv(client_sock, 1024))
+                await asyncio.sleep(0.1)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                assert task.cancelled()
+                data = await loop.sock_recv(client_sock, 1024)
+
+            await fut
+
+        return data
+
+    def client(addr):
+        sock = socket.socket()
+        with sock:
+            sock.connect(addr)
+            time.sleep(0.3)
+            sock.sendall(b'x')
+
+    data = loop.run_until_complete(server())
+    assert data == b'x'

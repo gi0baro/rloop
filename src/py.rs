@@ -33,6 +33,27 @@ fn weakref(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
         .bind(py))
 }
 
+#[inline(always)]
+pub(crate) fn fut_done(py: Python, fut: &Py<PyAny>) -> bool {
+    fut.call_method0(py, pyo3::intern!(py, "done"))
+        .map_or(true, |v| v.is_truthy(py).unwrap_or(true))
+}
+
+#[inline(always)]
+pub(crate) fn fut_set_result(py: Python, fut: &Py<PyAny>, val: Py<PyAny>) {
+    _ = fut.call_method1(py, pyo3::intern!(py, "set_result"), (val,));
+}
+
+#[inline(always)]
+pub(crate) fn fut_set_pyerr(py: Python, fut: &Py<PyAny>, err: PyErr) {
+    _ = fut.call_method1(py, pyo3::intern!(py, "set_exception"), (err.into_value(py),));
+}
+
+#[inline(always)]
+pub(crate) fn fut_set_exc(py: Python, fut: &Py<PyAny>, err: std::io::Error) {
+    fut_set_pyerr(py, fut, PyErr::from(err));
+}
+
 pub(crate) fn copy_context(py: Python) -> Py<PyAny> {
     let ctx = unsafe {
         let ptr = pyo3::ffi::PyContext_CopyCurrent();

@@ -17,14 +17,16 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
     server::Server,
-    sock::PseudoSocket,
+    sock::{PseudoSocket, PySockHandleData, PySockOp, PySockOpHandle},
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
     udp::{UDPReadHandle, UDPTransport, UDPWriteHandle},
+    utils::WriteChunk,
 };
 
 enum IOHandle {
     Py(PyHandleData),
+    PySock(Arc<Mutex<PySockHandleData>>),
     Signals,
     TCPListener(TCPListenerHandleData),
     TCPStream(Interest),
@@ -159,6 +161,7 @@ impl EventLoop {
                 if let Some(io_handle) = io_handles.get(&event.token()) {
                     match io_handle {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
+                        IOHandle::PySock(handle) => Self::handle_io_pysock(event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(py, event, &mut cb_handles),
                         IOHandle::UDPSocket(_) => self.handle_io_udp(py, event, &mut cb_handles),
@@ -226,6 +229,115 @@ impl EventLoop {
             && event.is_writable()
         {
             handles.push_back(Box::new(cbw.clone_ref(py)));
+        }
+    }
+
+    #[inline]
+    fn handle_io_pysock(
+        event: &event::Event,
+        handle: &Arc<Mutex<PySockHandleData>>,
+        handles: &mut VecDeque<BoxedHandle>,
+    ) {
+        let guard = handle.lock().unwrap();
+        if guard.reader.is_some() && event.is_readable() {
+            handles.push_back(Box::new(PySockOpHandle {
+                data: handle.clone(),
+                write: false,
+            }));
+        }
+        if guard.writer.is_some() && event.is_writable() {
+            handles.push_back(Box::new(PySockOpHandle {
+                data: handle.clone(),
+                write: true,
+            }));
+        }
+    }
+
+    pub(crate) fn py_sock_cleanup(&self, data: &Arc<Mutex<PySockHandleData>>) {
+        let mut remove = false;
+        let fd;
+        {
+            let mut guard = data.lock().unwrap();
+            fd = guard.fd;
+            let interest = match (guard.reader.is_some(), guard.writer.is_some()) {
+                (false, false) => None,
+                (true, false) => Some(Interest::READABLE),
+                (false, true) => Some(Interest::WRITABLE),
+                (true, true) => Some(Interest::READABLE | Interest::WRITABLE),
+            };
+            match interest {
+                None => remove = true,
+                Some(interest) => {
+                    if guard.interest != interest {
+                        let mut source = Source::FD(fd);
+                        let guard_poll = self.io.lock().unwrap();
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            _ = guard_poll
+                                .registry()
+                                .reregister(&mut source, Token(fd as usize), interest);
+                        }
+                        guard.interest = interest;
+                    }
+                }
+            }
+        }
+        if remove {
+            #[allow(clippy::cast_sign_loss)]
+            self.handles_io.pin().remove(&Token(fd as usize));
+            let mut source = Source::FD(fd);
+            let guard_poll = self.io.lock().unwrap();
+            _ = guard_poll.registry().deregister(&mut source);
+        }
+    }
+
+    fn py_sock_op_add(&self, fd: usize, op: PySockOp, write: bool) -> PyResult<()> {
+        let token = Token(fd);
+        let interest_op = match write {
+            true => Interest::WRITABLE,
+            false => Interest::READABLE,
+        };
+        let handles = self.handles_io.pin();
+        match handles.get(&token) {
+            None => {
+                #[allow(clippy::cast_possible_wrap)]
+                let mut source = Source::FD(fd as i32);
+                {
+                    let guard_poll = self.io.lock().unwrap();
+                    guard_poll.registry().register(&mut source, token, interest_op)?;
+                }
+                #[allow(clippy::cast_possible_wrap)]
+                handles.insert(
+                    token,
+                    IOHandle::PySock(Arc::new(Mutex::new(PySockHandleData::new(fd as i32, op, interest_op)))),
+                );
+                Ok(())
+            }
+            Some(IOHandle::PySock(handle)) => {
+                let mut guard = handle.lock().unwrap();
+                let slot = match write {
+                    true => &mut guard.writer,
+                    false => &mut guard.reader,
+                };
+                if slot.is_some() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "File descriptor {fd} already has a pending socket operation"
+                    )));
+                }
+                *slot = Some(op);
+                let interest = guard.interest | interest_op;
+                if guard.interest != interest {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let mut source = Source::FD(fd as i32);
+                    let guard_poll = self.io.lock().unwrap();
+                    _ = guard_poll.registry().reregister(&mut source, token, interest);
+                    guard.interest = interest;
+                }
+                Ok(())
+            }
+            Some(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "File descriptor {fd} is used by another handle"
+            ))),
         }
     }
 
@@ -1184,6 +1296,46 @@ impl EventLoop {
                 true
             }
         }
+    }
+
+    fn _sock_recv_native(&self, fd: usize, fut: Py<PyAny>, n: usize) -> PyResult<()> {
+        self.py_sock_op_add(fd, PySockOp::Recv { fut, n }, false)
+    }
+
+    fn _sock_recv_into_native(&self, fd: usize, fut: Py<PyAny>, buf: Py<PyAny>) -> PyResult<()> {
+        self.py_sock_op_add(fd, PySockOp::RecvInto { fut, buf }, false)
+    }
+
+    fn _sock_sendall_native(&self, fd: usize, fut: Py<PyAny>, data: &Bound<PyAny>, sent: usize) -> PyResult<()> {
+        let chunk = match data.cast::<pyo3::types::PyBytes>() {
+            Ok(pybytes) => WriteChunk::py(pybytes, sent),
+            _ => {
+                let bytes = data.extract::<std::borrow::Cow<[u8]>>()?;
+                WriteChunk::owned((&bytes[sent..]).into())
+            }
+        };
+        self.py_sock_op_add(fd, PySockOp::SendAll { fut, chunk }, true)
+    }
+
+    fn _sock_op_cancel(&self, fd: usize, write: bool) {
+        let token = Token(fd);
+        let data = {
+            let handles = self.handles_io.pin();
+            let Some(IOHandle::PySock(handle)) = handles.get(&token) else {
+                return;
+            };
+            let mut guard = handle.lock().unwrap();
+            let slot = match write {
+                true => &mut guard.writer,
+                false => &mut guard.reader,
+            };
+            if slot.take().is_none() {
+                return;
+            }
+            drop(guard);
+            handle.clone()
+        };
+        self.py_sock_cleanup(&data);
     }
 
     fn _tcp_conn(

@@ -8,7 +8,7 @@ class _SyncSockReaderFuture(_Future):
 
     def cancel(self, msg=None) -> bool:
         if self.__sock is not None and self.__sock.fileno() != -1:
-            self._loop.remove_reader(self.__sock)
+            self._loop.remove_reader(self.__sock.fileno())
             self.__sock = None
         return super().cancel(msg)
 
@@ -20,6 +20,30 @@ class _SyncSockWriterFuture(_Future):
 
     def cancel(self, msg=None) -> bool:
         if self.__sock is not None and self.__sock.fileno() != -1:
-            self._loop.remove_writer(self.__sock)
+            self._loop.remove_writer(self.__sock.fileno())
+            self.__sock = None
+        return super().cancel(msg)
+
+
+class _NativeSockReaderFuture(_Future):
+    def __init__(self, sock, loop):
+        super().__init__(loop=loop)
+        self.__sock = sock
+
+    def cancel(self, msg=None) -> bool:
+        if self.__sock is not None and self.__sock.fileno() != -1:
+            self._loop._sock_op_cancel(self.__sock.fileno(), False)
+            self.__sock = None
+        return super().cancel(msg)
+
+
+class _NativeSockWriterFuture(_Future):
+    def __init__(self, sock, loop):
+        super().__init__(loop=loop)
+        self.__sock = sock
+
+    def cancel(self, msg=None) -> bool:
+        if self.__sock is not None and self.__sock.fileno() != -1:
+            self._loop._sock_op_cancel(self.__sock.fileno(), True)
             self.__sock = None
         return super().cancel(msg)

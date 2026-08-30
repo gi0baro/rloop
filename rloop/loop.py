@@ -20,7 +20,7 @@ from typing import Union
 from ._compat import _PY_311, _PYV
 from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle
 from .exc import _exception_handler
-from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
+from .futures import _NativeSockReaderFuture, _NativeSockWriterFuture, _SyncSockReaderFuture, _SyncSockWriterFuture
 from .server import Server
 from .subprocess import (
     _PidfdChildWatcher,
@@ -831,47 +831,29 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         if self._tcp_stream_bound(fileno):
             raise RuntimeError(f'File descriptor {fd!r} is used by transport')
 
-    def sock_recv(self, sock, nbytes) -> _Future:
-        future = _SyncSockReaderFuture(sock, self)
+    async def sock_recv(self, sock, nbytes):
+        try:
+            return sock.recv(nbytes)
+        except (BlockingIOError, InterruptedError):
+            pass
+
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
-        self.add_reader(fd, self._sock_recv, future, sock, nbytes)
-        return future
+        future = _NativeSockReaderFuture(sock, self)
+        self._sock_recv_native(fd, future, nbytes)
+        return await future
 
-    def _sock_recv(self, fut, sock, n):
+    async def sock_recv_into(self, sock, buf):
         try:
-            data = sock.recv(n)
+            return sock.recv_into(buf)
         except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-            self.remove_reader(sock.fileno())
-        else:
-            fut.set_result(data)
-            self.remove_reader(sock.fileno())
+            pass
 
-    def sock_recv_into(self, sock, buf) -> _Future:
-        future = _SyncSockReaderFuture(sock, self)
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
-        self.add_reader(fd, self._sock_recv_into, future, sock, buf)
-        return future
-
-    def _sock_recv_into(self, fut, sock, buf):
-        try:
-            data = sock.recv_into(buf)
-        except (BlockingIOError, InterruptedError):
-            return
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-            self.remove_reader(sock.fileno())
-        else:
-            fut.set_result(data)
-            self.remove_reader(sock.fileno())
+        future = _NativeSockReaderFuture(sock, self)
+        self._sock_recv_into_native(fd, future, buf)
+        return await future
 
     # async def sock_recvfrom(self, sock, bufsize):
     #     raise NotImplementedError
@@ -893,31 +875,9 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
-        future = _SyncSockWriterFuture(sock, self)
-        self.add_writer(fd, self._sock_sendall, future, sock, memoryview(data), [n])
+        future = _NativeSockWriterFuture(sock, self)
+        self._sock_sendall_native(fd, future, data, n)
         return await future
-
-    def _sock_sendall(self, fut, sock, data, pos):
-        start = pos[0]
-
-        try:
-            n = sock.send(data[start:])
-        except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-            self.remove_writer(sock.fileno())
-            return
-
-        start += n
-
-        if start == len(data):
-            fut.set_result(None)
-            self.remove_writer(sock.fileno())
-        else:
-            pos[0] = start
 
     # async def sock_sendto(self, sock, data, address):
     #     raise NotImplementedError
