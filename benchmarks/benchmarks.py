@@ -42,7 +42,7 @@ def server(loop, streams=False, proto=False):
     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
-def client(duration, concurrency, msgsize):
+def client(duration, concurrency, msgsize, pipelined=False):
     exc_prefix = os.environ.get('BENCHMARK_EXC_PREFIX')
     py = 'python'
     if exc_prefix:
@@ -56,6 +56,8 @@ def client(duration, concurrency, msgsize):
         f'--msize {msgsize}',
         '--output json',
     ]
+    if pipelined:
+        cmd_parts.append('--pipelined')
     try:
         proc = subprocess.run(  # noqa: S602
             ' '.join(cmd_parts),
@@ -70,21 +72,21 @@ def client(duration, concurrency, msgsize):
         return {}
 
 
-def benchmark(msgs=None, concurrencies=None):
+def benchmark(msgs=None, concurrencies=None, pipelined=False):
     concurrencies = concurrencies or CONCURRENCIES
     msgs = msgs or MSGS
     results = {}
     # primer
-    client(1, 1, 1024)
+    client(1, 1, 1024, pipelined=pipelined)
     time.sleep(1)
     # warm up
-    client(1, max(concurrencies), 1024 * 100)
+    client(1, max(concurrencies), 1024 * 100, pipelined=pipelined)
     time.sleep(2)
     # bench
     for concurrency in concurrencies:
         cres = results[concurrency] = {}
         for msg in msgs:
-            res = client(10, concurrency, msg)
+            res = client(10, concurrency, msg, pipelined=pipelined)
             cres[msg] = res
             time.sleep(3)
         time.sleep(1)
@@ -96,6 +98,14 @@ def raw():
     for loop in get_loops():
         with server(loop):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
+    return results
+
+
+def raw_pipelined():
+    results = {}
+    for loop in get_loops():
+        with server(loop):
+            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]], pipelined=True)
     return results
 
 
@@ -132,6 +142,7 @@ def _rloop_version():
 def run():
     all_benchmarks = {
         'raw': raw,
+        'raw_pipelined': raw_pipelined,
         'stream': stream,
         'proto': proto,
         # 'concurrency': concurrency,

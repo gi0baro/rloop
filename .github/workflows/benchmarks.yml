@@ -28,7 +28,7 @@ jobs:
     - name: benchmark
       working-directory: ./benchmarks
       run: |
-        python benchmarks.py raw stream proto
+        python benchmarks.py raw raw_pipelined stream proto
     - name: upload results
       uses: actions/upload-artifact@v7
       with:

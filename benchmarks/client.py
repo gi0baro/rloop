@@ -2,7 +2,9 @@ import argparse
 import json
 import math
 import socket
+import threading
 import time
+from collections import deque
 from concurrent import futures
 
 import numpy as np
@@ -69,6 +71,69 @@ def bench(unix, addr, start, duration, timeout, reqsize, msg):
     return n, latency_stats, min_latency, max_latency
 
 
+def bench_pipelined(unix, addr, start, duration, timeout, reqsize, msg):
+    if unix:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    sock.settimeout(timeout / 1000)
+    sock.connect(addr)
+
+    send_times = deque()
+    stop = threading.Event()
+
+    def sender():
+        while not stop.is_set():
+            try:
+                send_times.append(time.monotonic())
+                sock.sendall(msg)
+            except OSError:
+                break
+
+    sender_thread = threading.Thread(target=sender, daemon=True)
+    sender_thread.start()
+
+    n = 0
+    latency_stats = np.zeros((timeout * 100,))
+    min_latency = float('inf')
+    max_latency = 0.0
+    nrecv = 0
+
+    while time.monotonic() - start < duration:
+        data = sock.recv(1 << 18)
+        if not data:
+            break
+        nrecv += len(data)
+        now = time.monotonic()
+        while nrecv >= reqsize:
+            nrecv -= reqsize
+            req_time = round((now - send_times.popleft()) * 100000)
+            if req_time > max_latency:
+                max_latency = req_time
+            if req_time < min_latency:
+                min_latency = req_time
+            latency_stats[req_time] += 1
+            n += 1
+    stop.set()
+
+    # graceful shutdown: stop sending, drain in-flight echoes until EOF,
+    # so the server sees a clean disconnect instead of a reset
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        while sock.recv(1 << 18):
+            pass
+    except OSError:
+        pass
+
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+    return n, latency_stats, min_latency, max_latency
+
+
 def run(args):
     unix = False
     if args.addr.startswith('file:'):
@@ -95,10 +160,12 @@ def run(args):
     latency_stats = None
     start = time.monotonic()
 
+    target = bench_pipelined if args.pipelined else bench
+
     with futures.ProcessPoolExecutor(max_workers=wrk) as e:
         fs = []
         for _ in range(wrk):
-            fs.append(e.submit(bench, unix, addr, start, duration, timeout, req_size, msg))
+            fs.append(e.submit(target, unix, addr, start, duration, timeout, req_size, msg))
 
         res = futures.wait(fs)
         for fut in res.done:
@@ -154,6 +221,7 @@ if __name__ == '__main__':
     parser.add_argument('--duration', '-T', default=10, type=int, help='duration of test in seconds')
     parser.add_argument('--concurrency', default=1, type=int, help='request concurrency')
     parser.add_argument('--timeout', default=2, type=int, help='socket timeout in seconds')
+    parser.add_argument('--pipelined', default=False, action='store_true', help='pipelined mode: keep messages in flight')
     parser.add_argument('--addr', default='127.0.0.1:25000', type=str, help='server address')
     parser.add_argument('--output', default='text', type=str, help='output format', choices=['text', 'json'])
     run(parser.parse_args())
